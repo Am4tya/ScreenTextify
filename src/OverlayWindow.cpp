@@ -1,0 +1,860 @@
+#include "OverlayWindow.h"
+#include "OcrService.h"
+#include "TextFormatter.h"
+
+#include <windowsx.h>
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+#include <iomanip>
+
+namespace ScreenTextify {
+
+namespace {
+constexpr wchar_t OVERLAY_CLASS_NAME[] = L"ScreenTextifyOverlayWnd";
+constexpr UINT_PTR TIMER_TOAST_ID = 1001;
+constexpr UINT_PTR TIMER_AUTOCLOSE_ID = 1002;
+
+enum HudButtonId {
+    BTN_CODE_MODE = 1,
+    BTN_LINE_MODE = 2,
+    BTN_COPY_ALL  = 3,
+    BTN_NEW_CROP  = 4,
+    BTN_CLOSE     = 5
+};
+} // namespace
+
+OverlayWindow::OverlayWindow(HINSTANCE hInstance, AppSettings* settings, OnTextCopiedCallback onCopied)
+    : m_hInstance(hInstance), m_settings(settings), m_onCopied(std::move(onCopied)) {}
+
+OverlayWindow::~OverlayWindow() {
+    DiscardD2DResources();
+    if (m_hudTextFormat) m_hudTextFormat->Release();
+    if (m_bannerTextFormat) m_bannerTextFormat->Release();
+    if (m_monoPreviewFormat) m_monoPreviewFormat->Release();
+    if (m_dwriteFactory) m_dwriteFactory->Release();
+    if (m_d2dFactory) m_d2dFactory->Release();
+    if (m_hwnd) DestroyWindow(m_hwnd);
+}
+
+bool OverlayWindow::Initialize() {
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_d2dFactory);
+    if (FAILED(hr)) return false;
+
+    hr = DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(&m_dwriteFactory)
+    );
+    if (FAILED(hr)) return false;
+
+    m_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        13.0f, L"en-us", &m_hudTextFormat
+    );
+    if (m_hudTextFormat) {
+        m_hudTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        m_hudTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    m_dwriteFactory->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        14.5f, L"en-us", &m_bannerTextFormat
+    );
+    if (m_bannerTextFormat) {
+        m_bannerTextFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        m_bannerTextFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    m_dwriteFactory->CreateTextFormat(
+        L"Consolas", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        12.5f, L"en-us", &m_monoPreviewFormat
+    );
+    if (m_monoPreviewFormat) {
+        m_monoPreviewFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = OverlayWindow::WndProc;
+    wc.hInstance = m_hInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_CROSS);
+    wc.lpszClassName = OVERLAY_CLASS_NAME;
+    RegisterClassExW(&wc);
+
+    m_hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        OVERLAY_CLASS_NAME,
+        L"ScreenTextify Overlay",
+        WS_POPUP,
+        0, 0, 100, 100,
+        nullptr, nullptr, m_hInstance, this
+    );
+
+    return m_hwnd != nullptr;
+}
+
+void OverlayWindow::StartCaptureSession(CaptureLaunchMode mode) {
+    if (!m_hwnd) return;
+    m_launchMode = mode;
+
+    if (m_phase != OverlayPhase::Hidden) {
+        ShowWindow(m_hwnd, SW_HIDE);
+        Sleep(35);
+    }
+
+    m_frozenScreen = ScreenCapture::CaptureVirtualScreen();
+    if (!m_frozenScreen.valid()) return;
+
+    DiscardD2DResources();
+
+    m_ocrDoc = OcrDocument{};
+    m_ocrError.clear();
+    m_isDragging = false;
+    m_toastExpireTick = 0;
+    m_toastTitle.clear();
+    m_toastPreview.clear();
+
+    SetWindowPos(
+        m_hwnd, HWND_TOPMOST,
+        m_frozenScreen.screenOriginX,
+        m_frozenScreen.screenOriginY,
+        m_frozenScreen.width,
+        m_frozenScreen.height,
+        SWP_SHOWWINDOW
+    );
+
+    SetForegroundWindow(m_hwnd);
+    SetFocus(m_hwnd);
+
+    if (mode == CaptureLaunchMode::FullScreenSelect) {
+        ScanActiveMonitorFull();
+    } else {
+        m_phase = OverlayPhase::SelectingRegion;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+    }
+}
+
+void OverlayWindow::CloseOverlay() {
+    if (!m_hwnd) return;
+    KillTimer(m_hwnd, TIMER_TOAST_ID);
+    KillTimer(m_hwnd, TIMER_AUTOCLOSE_ID);
+    ReleaseCapture();
+    m_isDragging = false;
+    m_phase = OverlayPhase::Hidden;
+    ShowWindow(m_hwnd, SW_HIDE);
+}
+
+void OverlayWindow::ScanActiveMonitorFull() {
+    POINT pt = {};
+    GetCursorPos(&pt);
+    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(MONITORINFO);
+    RectF region = {
+        0.0f, 0.0f,
+        static_cast<float>(m_frozenScreen.width),
+        static_cast<float>(m_frozenScreen.height)
+    };
+    if (GetMonitorInfoW(hMon, &mi)) {
+        region.x = static_cast<float>(mi.rcMonitor.left - m_frozenScreen.screenOriginX);
+        region.y = static_cast<float>(mi.rcMonitor.top - m_frozenScreen.screenOriginY);
+        region.width = static_cast<float>(mi.rcMonitor.right - mi.rcMonitor.left);
+        region.height = static_cast<float>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    }
+    RunOcrOnRegion(region);
+}
+
+void OverlayWindow::RunOcrOnRegion(const RectF& localRegion) {
+    RectF norm = localRegion.normalized();
+    if (norm.width < 12.0f || norm.height < 10.0f) {
+        return;
+    }
+
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+
+    m_activeScanRegion = norm;
+    m_ocrError.clear();
+
+    int scale = 1;
+    if (m_settings && m_settings->upscaleForOcr) {
+        if (norm.width < 950.0f && norm.height < 600.0f) {
+            scale = 3;
+        } else if (norm.width < 1700.0f && norm.height < 1050.0f) {
+            scale = 2;
+        }
+    }
+
+    RawBitmap cropped = ScreenCapture::CropAndScale(m_frozenScreen, norm, scale);
+    m_ocrDoc = OcrService::RecognizeBitmap(cropped, &m_ocrError);
+
+    std::wstringstream msStream;
+    msStream << m_ocrDoc.totalWords() << L" words \x2022 "
+             << std::fixed << std::setprecision(0) << m_ocrDoc.recognitionTimeMs << L" ms";
+    m_hudMetricsText = msStream.str();
+
+    m_phase = OverlayPhase::InteractiveText;
+    UpdateHudLayout();
+
+    // If launched via QuickSnipCopy (Alt+Shift+C), immediately select & copy all detected text!
+    if (m_launchMode == CaptureLaunchMode::QuickSnipCopy && !m_ocrDoc.empty()) {
+        CopyCurrentSelection(true);
+        SetTimer(m_hwnd, TIMER_AUTOCLOSE_ID, 520, nullptr);
+    }
+
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void OverlayWindow::UpdateHudLayout() {
+    m_hudButtons.clear();
+
+    float barWidth = 780.0f;
+    float barHeight = 44.0f;
+
+    float barX = m_activeScanRegion.centerX() - barWidth * 0.5f;
+    barX = std::clamp(barX, 16.0f, std::max(16.0f, static_cast<float>(m_frozenScreen.width) - barWidth - 16.0f));
+
+    float barY = m_activeScanRegion.y - barHeight - 12.0f;
+    if (barY < 14.0f) {
+        barY = m_activeScanRegion.bottom() + 12.0f;
+        if (barY + barHeight > m_frozenScreen.height - 14.0f) {
+            barY = m_activeScanRegion.y + 12.0f;
+        }
+    }
+
+    m_hudBarRect = { barX, barY, barWidth, barHeight };
+
+    bool codeOn = m_settings ? m_settings->codeIndentationMode : true;
+    bool lineOn = m_settings ? m_settings->lineSelectionMode : false;
+
+    struct BtnSpec {
+        int id;
+        std::wstring text;
+        float width;
+        bool active;
+    };
+
+    std::vector<BtnSpec> specs = {
+        { BTN_CODE_MODE, codeOn ? L"Code Indent: ON (C)" : L"Code Indent: OFF (C)", 152.0f, codeOn },
+        { BTN_LINE_MODE, lineOn ? L"Mode: Lines (L)" : L"Mode: Words (L)", 128.0f, lineOn },
+        { BTN_COPY_ALL,  L"Copy All (Ctrl+A)", 130.0f, false },
+        { BTN_NEW_CROP,  L"Re-Crop (R)", 102.0f, false },
+        { BTN_CLOSE,     L"Close (Esc)", 92.0f, false }
+    };
+
+    float curX = barX + 146.0f; // Leave 136px on the left for the live OCR metrics pill
+    for (const auto& s : specs) {
+        HudButton btn;
+        btn.id = s.id;
+        btn.label = s.text;
+        btn.bounds = { curX, barY + 6.0f, s.width, barHeight - 12.0f };
+        btn.active = s.active;
+        m_hudButtons.push_back(btn);
+        curX += s.width + 6.0f;
+    }
+}
+
+void OverlayWindow::UpdateSelectionFromDrag(const RectF& dragRect, bool additive) {
+    RectF norm = dragRect.normalized();
+    bool isClick = (norm.width < 4.0f && norm.height < 4.0f);
+    bool lineMode = m_settings && m_settings->lineSelectionMode;
+
+    for (auto& line : m_ocrDoc.lines) {
+        bool lineHit = isClick ? line.bounds.contains(norm.x, norm.y) : line.bounds.intersects(norm);
+        for (auto& word : line.words) {
+            bool hit = lineMode ? lineHit
+                                : (isClick ? word.bounds.contains(norm.x, norm.y) : word.bounds.intersects(norm));
+            if (hit) {
+                word.selected = true;
+            } else if (!additive) {
+                word.selected = false;
+            }
+        }
+    }
+}
+
+void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected) {
+    if (m_ocrDoc.empty()) return;
+
+    bool anySelected = false;
+    for (const auto& line : m_ocrDoc.lines) {
+        for (const auto& word : line.words) {
+            if (word.selected) {
+                anySelected = true;
+                break;
+            }
+        }
+        if (anySelected) break;
+    }
+
+    if (!anySelected && !copyAllIfNoneSelected) {
+        return;
+    }
+
+    if (!anySelected && copyAllIfNoneSelected) {
+        for (auto& line : m_ocrDoc.lines) {
+            for (auto& word : line.words) {
+                word.selected = true;
+            }
+        }
+    }
+
+    bool codeMode = m_settings ? m_settings->codeIndentationMode : true;
+    size_t wordCount = 0;
+    std::wstring formatted = TextFormatter::FormatDocument(m_ocrDoc, true, codeMode, &wordCount);
+    if (formatted.empty()) return;
+
+    if (CopyTextToClipboard(m_hwnd, formatted)) {
+        if (m_onCopied) {
+            m_onCopied(formatted, codeMode, wordCount, m_ocrDoc.recognitionTimeMs);
+        }
+
+        std::wstring title = L"\x2713 Copied " + std::to_wstring(wordCount) +
+                             (wordCount == 1 ? L" word to Clipboard " : L" words to Clipboard ") +
+                             (codeMode ? L"\x2022 Code Indentation ON" : L"\x2022 Standard Text");
+        ShowToast(title, formatted);
+
+        if (m_settings && m_settings->autoCloseAfterCopy) {
+            SetTimer(m_hwnd, TIMER_AUTOCLOSE_ID, 480, nullptr);
+        }
+    }
+}
+
+void OverlayWindow::ShowToast(const std::wstring& message, const std::wstring& preview) {
+    m_toastTitle = message;
+    std::wstringstream ss(preview);
+    std::wstring line;
+    std::wstring clipped;
+    int lineCount = 0;
+    while (std::getline(ss, line) && lineCount < 6) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        if (line.length() > 78) line = line.substr(0, 75) + L"...";
+        if (lineCount > 0) clipped += L"\n";
+        clipped += line;
+        ++lineCount;
+    }
+    m_toastPreview = clipped;
+    m_toastExpireTick = GetTickCount64() + 2800;
+    SetTimer(m_hwnd, TIMER_TOAST_ID, 2850, nullptr);
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+bool OverlayWindow::CopyTextToClipboard(HWND hwndOwner, const std::wstring& text) {
+    if (!OpenClipboard(hwndOwner)) return false;
+    EmptyClipboard();
+
+    size_t byteCount = (text.length() + 1) * sizeof(wchar_t);
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteCount);
+    if (!hMem) {
+        CloseClipboard();
+        return false;
+    }
+
+    void* pMem = GlobalLock(hMem);
+    if (pMem) {
+        memcpy(pMem, text.c_str(), byteCount);
+        GlobalUnlock(hMem);
+        SetClipboardData(CF_UNICODETEXT, hMem);
+    } else {
+        GlobalFree(hMem);
+        CloseClipboard();
+        return false;
+    }
+
+    CloseClipboard();
+    return true;
+}
+
+void OverlayWindow::CreateD2DResources() {
+    if (m_renderTarget || !m_hwnd || !m_frozenScreen.valid()) return;
+
+    D2D1_SIZE_U size = D2D1::SizeU(m_frozenScreen.width, m_frozenScreen.height);
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties();
+    rtProps.dpiX = 96.0f;
+    rtProps.dpiY = 96.0f;
+
+    HRESULT hr = m_d2dFactory->CreateHwndRenderTarget(
+        rtProps,
+        D2D1::HwndRenderTargetProperties(m_hwnd, size),
+        &m_renderTarget
+    );
+
+    if (SUCCEEDED(hr) && m_renderTarget) {
+        D2D1_BITMAP_PROPERTIES bmpProps = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            96.0f, 96.0f
+        );
+        m_renderTarget->CreateBitmap(
+            size,
+            m_frozenScreen.pixels.data(),
+            m_frozenScreen.stride,
+            &bmpProps,
+            &m_screenBitmap
+        );
+        m_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &m_brush);
+    }
+}
+
+void OverlayWindow::DiscardD2DResources() {
+    if (m_brush) {
+        m_brush->Release();
+        m_brush = nullptr;
+    }
+    if (m_screenBitmap) {
+        m_screenBitmap->Release();
+        m_screenBitmap = nullptr;
+    }
+    if (m_renderTarget) {
+        m_renderTarget->Release();
+        m_renderTarget = nullptr;
+    }
+}
+
+void OverlayWindow::OnPaint() {
+    CreateD2DResources();
+    if (!m_renderTarget || !m_screenBitmap || !m_brush) return;
+
+    m_renderTarget->BeginDraw();
+
+    float fullW = static_cast<float>(m_frozenScreen.width);
+    float fullH = static_cast<float>(m_frozenScreen.height);
+    D2D1_RECT_F fullRect = D2D1::RectF(0.0f, 0.0f, fullW, fullH);
+
+    m_renderTarget->DrawBitmap(m_screenBitmap, fullRect);
+
+    if (m_phase == OverlayPhase::SelectingRegion) {
+        m_brush->SetColor(D2D1::ColorF(0.03f, 0.05f, 0.10f, 0.56f));
+        m_renderTarget->FillRectangle(fullRect, m_brush);
+
+        if (m_isDragging) {
+            RectF sel = RectF{ m_dragStartX, m_dragStartY, m_mouseX - m_dragStartX, m_mouseY - m_dragStartY }.normalized();
+            D2D1_RECT_F d2dSel = D2D1::RectF(sel.x, sel.y, sel.right(), sel.bottom());
+
+            m_renderTarget->DrawBitmap(m_screenBitmap, d2dSel, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, d2dSel);
+
+            m_brush->SetColor(D2D1::ColorF(0.22f, 0.74f, 0.97f, 0.98f));
+            m_renderTarget->DrawRectangle(d2dSel, m_brush, 2.0f);
+
+            // Corner handles
+            float ch = 12.0f;
+            m_brush->SetColor(D2D1::ColorF(0.38f, 0.85f, 1.0f, 1.0f));
+            m_renderTarget->DrawLine({ sel.x, sel.y }, { sel.x + ch, sel.y }, m_brush, 3.5f);
+            m_renderTarget->DrawLine({ sel.x, sel.y }, { sel.x, sel.y + ch }, m_brush, 3.5f);
+            m_renderTarget->DrawLine({ sel.right() - ch, sel.y }, { sel.right(), sel.y }, m_brush, 3.5f);
+            m_renderTarget->DrawLine({ sel.right(), sel.y }, { sel.right(), sel.y + ch }, m_brush, 3.5f);
+
+            std::wstring dimText = std::to_wstring(static_cast<int>(sel.width)) + L" \x00D7 " + std::to_wstring(static_cast<int>(sel.height)) + L" px";
+            D2D1_RECT_F badgeRect = D2D1::RectF(sel.x, std::max(4.0f, sel.y - 28.0f), sel.x + 120.0f, std::max(28.0f, sel.y - 4.0f));
+            m_brush->SetColor(D2D1::ColorF(0.05f, 0.08f, 0.15f, 0.92f));
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(badgeRect, 6.0f, 6.0f), m_brush);
+            m_brush->SetColor(D2D1::ColorF(0.45f, 0.85f, 1.0f, 1.0f));
+            if (m_hudTextFormat) {
+                m_renderTarget->DrawTextW(dimText.c_str(), static_cast<UINT32>(dimText.length()), m_hudTextFormat, badgeRect, m_brush);
+            }
+        }
+
+        float bannerW = 720.0f;
+        float bannerH = 46.0f;
+        float bx = (fullW - bannerW) * 0.5f;
+        D2D1_RECT_F bannerRect = D2D1::RectF(bx, 24.0f, bx + bannerW, 24.0f + bannerH);
+        m_brush->SetColor(D2D1::ColorF(0.05f, 0.08f, 0.15f, 0.94f));
+        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(bannerRect, 12.0f, 12.0f), m_brush);
+        m_brush->SetColor(D2D1::ColorF(0.22f, 0.74f, 0.97f, 0.85f));
+        m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(bannerRect, 12.0f, 12.0f), m_brush, 1.5f);
+
+        std::wstring prompt = (m_launchMode == CaptureLaunchMode::QuickSnipCopy)
+            ? L"Quick Snip Mode: Drag over any video/image to immediately copy all text   \x2022   [Esc] Cancel"
+            : L"Selectext Mode: Drag over video/image to detect words   \x2022   [Space / F] Full Screen   \x2022   [Esc] Cancel";
+        m_brush->SetColor(D2D1::ColorF(0.95f, 0.98f, 1.0f, 1.0f));
+        if (m_bannerTextFormat) {
+            m_renderTarget->DrawTextW(prompt.c_str(), static_cast<UINT32>(prompt.length()), m_bannerTextFormat, bannerRect, m_brush);
+        }
+    } else if (m_phase == OverlayPhase::InteractiveText) {
+        RectF sr = m_activeScanRegion;
+        m_brush->SetColor(D2D1::ColorF(0.03f, 0.05f, 0.10f, 0.60f));
+        if (sr.y > 0) m_renderTarget->FillRectangle(D2D1::RectF(0, 0, fullW, sr.y), m_brush);
+        if (sr.bottom() < fullH) m_renderTarget->FillRectangle(D2D1::RectF(0, sr.bottom(), fullW, fullH), m_brush);
+        if (sr.x > 0) m_renderTarget->FillRectangle(D2D1::RectF(0, sr.y, sr.x, sr.bottom()), m_brush);
+        if (sr.right() < fullW) m_renderTarget->FillRectangle(D2D1::RectF(sr.right(), sr.y, fullW, sr.bottom()), m_brush);
+
+        D2D1_RECT_F srRect = D2D1::RectF(sr.x, sr.y, sr.right(), sr.bottom());
+        m_brush->SetColor(D2D1::ColorF(0.22f, 0.74f, 0.97f, 0.75f));
+        m_renderTarget->DrawRectangle(srRect, m_brush, 1.6f);
+
+        // Draw Selectext interactive word boxes
+        for (const auto& line : m_ocrDoc.lines) {
+            for (const auto& word : line.words) {
+                D2D1_RECT_F wr = D2D1::RectF(
+                    word.bounds.x - 2.0f,
+                    word.bounds.y - 1.5f,
+                    word.bounds.right() + 2.0f,
+                    word.bounds.bottom() + 1.5f
+                );
+                D2D1_ROUNDED_RECT rrect = D2D1::RoundedRect(wr, 4.0f, 4.0f);
+
+                if (word.selected) {
+                    m_brush->SetColor(D2D1::ColorF(0.14f, 0.48f, 0.98f, 0.48f));
+                    m_renderTarget->FillRoundedRectangle(rrect, m_brush);
+                    m_brush->SetColor(D2D1::ColorF(0.42f, 0.78f, 1.0f, 1.0f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.7f);
+                } else if (word.hovered) {
+                    m_brush->SetColor(D2D1::ColorF(0.08f, 0.65f, 0.92f, 0.36f));
+                    m_renderTarget->FillRoundedRectangle(rrect, m_brush);
+                    m_brush->SetColor(D2D1::ColorF(0.28f, 0.82f, 1.0f, 0.95f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.5f);
+                } else {
+                    m_brush->SetColor(D2D1::ColorF(0.06f, 0.12f, 0.25f, 0.28f));
+                    m_renderTarget->FillRoundedRectangle(rrect, m_brush);
+                    m_brush->SetColor(D2D1::ColorF(0.22f, 0.74f, 0.97f, 0.52f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.0f);
+                }
+            }
+        }
+
+        if (m_isDragging) {
+            RectF lasso = RectF{ m_dragStartX, m_dragStartY, m_mouseX - m_dragStartX, m_mouseY - m_dragStartY }.normalized();
+            D2D1_RECT_F lr = D2D1::RectF(lasso.x, lasso.y, lasso.right(), lasso.bottom());
+            m_brush->SetColor(D2D1::ColorF(0.22f, 0.65f, 0.98f, 0.18f));
+            m_renderTarget->FillRectangle(lr, m_brush);
+            m_brush->SetColor(D2D1::ColorF(0.38f, 0.78f, 1.0f, 0.92f));
+            m_renderTarget->DrawRectangle(lr, m_brush, 1.5f);
+        }
+
+        if (m_ocrDoc.empty()) {
+            std::wstring msg = m_ocrError.empty()
+                ? L"No text detected in this area. Press [R] to crop another region or [F] for Full Screen."
+                : m_ocrError;
+            D2D1_RECT_F emptyBox = D2D1::RectF(sr.centerX() - 280.0f, sr.centerY() - 24.0f, sr.centerX() + 280.0f, sr.centerY() + 24.0f);
+            m_brush->SetColor(D2D1::ColorF(0.06f, 0.09f, 0.16f, 0.94f));
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(emptyBox, 8.0f, 8.0f), m_brush);
+            m_brush->SetColor(D2D1::ColorF(0.98f, 0.75f, 0.25f, 1.0f));
+            if (m_hudTextFormat) {
+                m_renderTarget->DrawTextW(msg.c_str(), static_cast<UINT32>(msg.length()), m_hudTextFormat, emptyBox, m_brush);
+            }
+        }
+
+        // Draw Floating HUD Toolbar
+        D2D1_RECT_F hudRect = D2D1::RectF(m_hudBarRect.x, m_hudBarRect.y, m_hudBarRect.right(), m_hudBarRect.bottom());
+        m_brush->SetColor(D2D1::ColorF(0.05f, 0.08f, 0.14f, 0.95f));
+        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(hudRect, 10.0f, 10.0f), m_brush);
+        m_brush->SetColor(D2D1::ColorF(0.22f, 0.36f, 0.58f, 0.88f));
+        m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(hudRect, 10.0f, 10.0f), m_brush, 1.3f);
+
+        // Metrics pill on left of HUD
+        D2D1_RECT_F metricsRect = D2D1::RectF(m_hudBarRect.x + 8.0f, m_hudBarRect.y + 6.0f, m_hudBarRect.x + 140.0f, m_hudBarRect.bottom() - 6.0f);
+        m_brush->SetColor(D2D1::ColorF(0.08f, 0.14f, 0.24f, 0.90f));
+        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(metricsRect, 6.0f, 6.0f), m_brush);
+        m_brush->SetColor(D2D1::ColorF(0.38f, 0.82f, 0.98f, 1.0f));
+        if (m_hudTextFormat) {
+            m_renderTarget->DrawTextW(m_hudMetricsText.c_str(), static_cast<UINT32>(m_hudMetricsText.length()), m_hudTextFormat, metricsRect, m_brush);
+        }
+
+        for (const auto& btn : m_hudButtons) {
+            D2D1_RECT_F br = D2D1::RectF(btn.bounds.x, btn.bounds.y, btn.bounds.right(), btn.bounds.bottom());
+            if (btn.active) {
+                m_brush->SetColor(D2D1::ColorF(0.12f, 0.45f, 0.90f, 0.92f));
+            } else if (btn.hovered) {
+                m_brush->SetColor(D2D1::ColorF(0.18f, 0.26f, 0.40f, 0.95f));
+            } else {
+                m_brush->SetColor(D2D1::ColorF(0.10f, 0.15f, 0.24f, 0.90f));
+            }
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(br, 6.0f, 6.0f), m_brush);
+
+            m_brush->SetColor(btn.active ? D2D1::ColorF(0.45f, 0.80f, 1.0f, 0.95f) : D2D1::ColorF(0.26f, 0.35f, 0.50f, 0.70f));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(br, 6.0f, 6.0f), m_brush, 1.0f);
+
+            m_brush->SetColor(D2D1::ColorF(0.95f, 0.98f, 1.0f, 1.0f));
+            if (m_hudTextFormat) {
+                m_renderTarget->DrawTextW(btn.label.c_str(), static_cast<UINT32>(btn.label.length()), m_hudTextFormat, br, m_brush);
+            }
+        }
+
+        // Draw Copied Toast & Live Code Preview Card
+        if (m_toastExpireTick > GetTickCount64() && !m_toastTitle.empty()) {
+            float toastW = 560.0f;
+            float toastH = m_toastPreview.empty() ? 48.0f : 148.0f;
+            float tx = std::clamp(m_activeScanRegion.centerX() - toastW * 0.5f, 20.0f, std::max(20.0f, fullW - toastW - 20.0f));
+            float ty = std::min(fullH - toastH - 24.0f, m_activeScanRegion.bottom() + 62.0f);
+            if (ty < 64.0f) ty = 64.0f;
+
+            D2D1_RECT_F toastRect = D2D1::RectF(tx, ty, tx + toastW, ty + toastH);
+            m_brush->SetColor(D2D1::ColorF(0.04f, 0.09f, 0.15f, 0.97f));
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(toastRect, 10.0f, 10.0f), m_brush);
+            m_brush->SetColor(D2D1::ColorF(0.18f, 0.85f, 0.62f, 0.95f));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(toastRect, 10.0f, 10.0f), m_brush, 1.8f);
+
+            D2D1_RECT_F titleRect = D2D1::RectF(tx + 14.0f, ty + 8.0f, tx + toastW - 14.0f, ty + 34.0f);
+            m_brush->SetColor(D2D1::ColorF(0.32f, 0.96f, 0.70f, 1.0f));
+            if (m_hudTextFormat) {
+                m_renderTarget->DrawTextW(m_toastTitle.c_str(), static_cast<UINT32>(m_toastTitle.length()), m_hudTextFormat, titleRect, m_brush);
+            }
+
+            if (!m_toastPreview.empty() && m_monoPreviewFormat) {
+                D2D1_RECT_F codeRect = D2D1::RectF(tx + 16.0f, ty + 38.0f, tx + toastW - 16.0f, ty + toastH - 10.0f);
+                m_renderTarget->PushAxisAlignedClip(codeRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                m_brush->SetColor(D2D1::ColorF(0.86f, 0.92f, 0.99f, 0.96f));
+                m_renderTarget->DrawTextW(m_toastPreview.c_str(), static_cast<UINT32>(m_toastPreview.length()), m_monoPreviewFormat, codeRect, m_brush);
+                m_renderTarget->PopAxisAlignedClip();
+            }
+        }
+    }
+
+    HRESULT hr = m_renderTarget->EndDraw();
+    if (hr == D2DERR_RECREATE_TARGET) {
+        DiscardD2DResources();
+    }
+}
+
+LRESULT CALLBACK OverlayWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    OverlayWindow* self = nullptr;
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        self = static_cast<OverlayWindow*>(cs->lpCreateParams);
+        if (self) {
+            self->m_hwnd = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+    } else {
+        self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    if (self) {
+        return self->HandleMessage(hwnd, msg, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        OnPaint();
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_SETCURSOR: {
+        if (m_phase == OverlayPhase::SelectingRegion) {
+            SetCursor(LoadCursor(nullptr, IDC_CROSS));
+            return TRUE;
+        } else if (m_phase == OverlayPhase::InteractiveText) {
+            bool overButton = false;
+            for (const auto& b : m_hudButtons) {
+                if (b.hovered) {
+                    overButton = true;
+                    break;
+                }
+            }
+            SetCursor(LoadCursor(nullptr, overButton ? IDC_HAND : IDC_IBEAM));
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_LBUTTONDOWN: {
+        float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        m_mouseX = mx;
+        m_mouseY = my;
+
+        if (m_phase == OverlayPhase::InteractiveText) {
+            for (const auto& btn : m_hudButtons) {
+                if (btn.bounds.contains(mx, my)) {
+                    switch (btn.id) {
+                    case BTN_CODE_MODE:
+                        if (m_settings) m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                        UpdateHudLayout();
+                        CopyCurrentSelection(false);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    case BTN_LINE_MODE:
+                        if (m_settings) m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                        UpdateHudLayout();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    case BTN_COPY_ALL:
+                        CopyCurrentSelection(true);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    case BTN_NEW_CROP:
+                        m_phase = OverlayPhase::SelectingRegion;
+                        m_isDragging = false;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    case BTN_CLOSE:
+                        CloseOverlay();
+                        break;
+                    }
+                    return 0;
+                }
+            }
+        }
+
+        m_isDragging = true;
+        m_dragStartX = mx;
+        m_dragStartY = my;
+        m_dragAdditive = (GetKeyState(VK_SHIFT) & 0x8000) != 0 || (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        SetCapture(hwnd);
+
+        if (m_phase == OverlayPhase::InteractiveText) {
+            UpdateSelectionFromDrag({ mx, my, 1.0f, 1.0f }, m_dragAdditive);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        m_mouseX = mx;
+        m_mouseY = my;
+
+        if (m_phase == OverlayPhase::SelectingRegion) {
+            if (m_isDragging) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        } else if (m_phase == OverlayPhase::InteractiveText) {
+            bool changed = false;
+            for (auto& btn : m_hudButtons) {
+                bool h = btn.bounds.contains(mx, my);
+                if (btn.hovered != h) {
+                    btn.hovered = h;
+                    changed = true;
+                }
+            }
+
+            if (m_isDragging) {
+                RectF dragRect = { m_dragStartX, m_dragStartY, mx - m_dragStartX, my - m_dragStartY };
+                UpdateSelectionFromDrag(dragRect, m_dragAdditive);
+                changed = true;
+            } else {
+                bool lineMode = m_settings && m_settings->lineSelectionMode;
+                for (auto& line : m_ocrDoc.lines) {
+                    bool lineHov = line.bounds.contains(mx, my);
+                    for (auto& word : line.words) {
+                        bool hov = lineMode ? lineHov : word.bounds.contains(mx, my);
+                        if (word.hovered != hov) {
+                            word.hovered = hov;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            if (changed) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (!m_isDragging) return 0;
+        m_isDragging = false;
+        ReleaseCapture();
+
+        float mx = static_cast<float>(GET_X_LPARAM(lParam));
+        float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        m_mouseX = mx;
+        m_mouseY = my;
+
+        if (m_phase == OverlayPhase::SelectingRegion) {
+            RectF crop = RectF{ m_dragStartX, m_dragStartY, mx - m_dragStartX, my - m_dragStartY }.normalized();
+            if (crop.width >= 14.0f && crop.height >= 12.0f) {
+                RunOcrOnRegion(crop);
+            } else {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        } else if (m_phase == OverlayPhase::InteractiveText) {
+            RectF dragRect = { m_dragStartX, m_dragStartY, mx - m_dragStartX, my - m_dragStartY };
+            UpdateSelectionFromDrag(dragRect, m_dragAdditive);
+            if (!m_settings || m_settings->autoCopyOnRelease) {
+                CopyCurrentSelection(false);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_RBUTTONUP: {
+        CloseOverlay();
+        return 0;
+    }
+
+    case WM_KEYDOWN: {
+        bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (wParam == VK_ESCAPE) {
+            CloseOverlay();
+            return 0;
+        }
+        if (m_phase == OverlayPhase::SelectingRegion) {
+            if (wParam == VK_SPACE || wParam == 'F') {
+                ScanActiveMonitorFull();
+                return 0;
+            }
+        } else if (m_phase == OverlayPhase::InteractiveText) {
+            if (ctrlDown && wParam == 'A') {
+                CopyCurrentSelection(true);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if ((ctrlDown && wParam == 'C') || wParam == VK_RETURN) {
+                CopyCurrentSelection(false);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!ctrlDown && wParam == 'C') {
+                if (m_settings) m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                UpdateHudLayout();
+                CopyCurrentSelection(false);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!ctrlDown && wParam == 'L') {
+                if (m_settings) m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                UpdateHudLayout();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!ctrlDown && wParam == 'R') {
+                m_phase = OverlayPhase::SelectingRegion;
+                m_isDragging = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!ctrlDown && wParam == 'F') {
+                ScanActiveMonitorFull();
+                return 0;
+            }
+        }
+        break;
+    }
+
+    case WM_TIMER: {
+        if (wParam == TIMER_TOAST_ID) {
+            KillTimer(hwnd, TIMER_TOAST_ID);
+            m_toastExpireTick = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        if (wParam == TIMER_AUTOCLOSE_ID) {
+            KillTimer(hwnd, TIMER_AUTOCLOSE_ID);
+            CloseOverlay();
+            return 0;
+        }
+        break;
+    }
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+} // namespace ScreenTextify

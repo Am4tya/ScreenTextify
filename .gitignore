@@ -1,0 +1,21 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+.vs/
+.vscode/
+
+# Compiled binaries and symbols
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
