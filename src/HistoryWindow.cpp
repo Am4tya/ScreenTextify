@@ -198,8 +198,8 @@ void HistoryWindow::AddHistoryEntry(const std::wstring& text, bool codeMode, siz
 }
 
 void HistoryWindow::RunBuiltInDemoCapture() {
-    RawBitmap frame = ScreenCapture::CreateSyntheticCodeFrame(800, 220);
-    RawBitmap scaled = ScreenCapture::CropAndScale(frame, { 0.0f, 0.0f, 800.0f, 220.0f }, 3);
+    RawBitmap frame = ScreenCapture::CreateSyntheticCodeFrame(800, 390);
+    RawBitmap scaled = ScreenCapture::CropAndScale(frame, { 0.0f, 0.0f, 800.0f, 390.0f }, 2);
     std::wstring err;
     OcrDocument doc = OcrService::RecognizeBitmap(scaled, &err);
     if (!doc.empty()) {

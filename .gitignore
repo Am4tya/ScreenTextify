@@ -13,6 +13,8 @@ cmake-build-*/
 *.lib
 *.exp
 *.dll
+!third_party/onnxruntime/bin/*.dll
+!third_party/onnxruntime/lib/*.lib
 
 # Temporary files
 *.log

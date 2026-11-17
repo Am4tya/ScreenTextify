@@ -1,4 +1,4 @@
-# ScreenTextify Studio — Selectext Alternative for Desktop (C++20 / Direct2D / WinRT OCR)
+# ScreenTextify Studio v3.0 — Selectext Alternative for Desktop (C++20 / Direct2D / PP-OCRv4 + WinRT OCR)
 
 **ScreenTextify Studio** is a high-performance, 100% free and offline native C++20 Windows desktop application designed to surpass the **Selectext** browser extension. It lets you interactively select and copy text or indented programming code directly from any video player, live stream, coding tutorial, Zoom meeting, image, PDF, or screen region.
 
@@ -12,12 +12,13 @@
   1. **Interactive Region Selectext (`Alt + Shift + S`)**: Freeze any video/image region and click or drag over highlighted word/line boxes to copy on mouse release.
   2. **Instant Full-Screen Selectext (`Alt + Shift + D`)**: Immediately freezes and detects all selectable text across the active monitor.
   3. **Quick Snip & Instant Copy (`Alt + Shift + C`)**: Drag a rectangle over any text/code to immediately OCR and copy all of it in a single step.
-- **Multi-Pass Code-Aware OCR Pipeline (`Windows.Media.Ocr` + Custom CV/DSA)**:
-  - **Horizontal-Strip 25th-Percentile Background Estimator**: Eliminates editor selection highlights (e.g., VS Code `#264F78` blue selection boxes), diff lines, and current-line highlights with zero vertical bleed across line boundaries.
-  - **Multi-Hue Syntax Contrast Equalization & S-Curve Mapping**: Equalizes multi-color syntax tokens (`Message.findOne(message?._id)`) into crisp ink without thickening ClearType inter-letter valleys (`3x` adaptive super-resolution upscaling).
-  - **8-Connected Component Topological Symbol Recovery**: Uses BFS connected-component labeling, curvature center-of-mass (`topMeanX`, `midMeanX`, `botMeanX`), and a quote/parenthesis parity state machine to recover standalone braces (`{`, `}`, `};`), trailing semicolons (`;`), underscores (`_`), quotes (`""`), parentheses (`()`), and `+=` operators.
+- **Hybrid PP-OCRv4 Code Engine (`PaddleOcr` on ONNX Runtime + `Windows.Media.Ocr` Fallback)**:
+  - **Horizontal-Strip 25th-Percentile Background Estimator**: Eliminates editor selection highlights (e.g., VS Code `#264F78` blue selection boxes), diff lines, and dimmed video overlays with zero vertical bleed across line boundaries.
+  - **2D 8-Connected Component Line & Clause Detector (~0.3 ms)**: Finds exact pixel-tight bounding boxes of every code line and standalone symbol (`{`, `}`, `};`, `(`, `)`), avoiding the ~500 ms overhead and symbol-dropping of scene-photo text detectors.
+  - **Character-Level `SVTR-LCNet` Neural Recognition (`rec_en.onnx`)**: Decodes all 95 printable ASCII characters (including `=>`, `<div>`, `""`, `[0]`, `{step,setStep,...}`) directly on CPU.
+  - **Pushdown Automaton (PDA) Delimiter Stack & Topological Verifier**: Tracks open `{` and `(` delimiters across lines to disambiguate standalone closing `)` vs `}`, recovers CTC-collapsed empty strings (`""`), and verifies `=` vs `-` via vertical scanline bar profiles.
 - **Smart Code Indentation Reconstruction**:
-  - Clusters words and vertically overlapping punctuation into visual lines, calculates median character width, normalizes monospace slashed zeros (`ø` → `0`), glues split sub-tokens across `.`, `?.`, `(`, `)`, `;`, `,`, and reconstructs 2/4/8-space code indentation and blank lines.
+  - Clusters words and vertically overlapping punctuation into visual lines, calculates median character width, normalizes monospace slashed zeros (`ø` → `0`), glues split sub-tokens, and reconstructs 2/4/8-space code indentation and blank lines.
 
 ---
 
@@ -52,4 +53,9 @@ Launch the executable:
 Run the automated GUI & OCR verification suite:
 ```powershell
 .\build\ScreenTextify.exe --self-test | Out-String
+```
+
+Run CLI OCR on any image file (or crop `[x y w h]`):
+```powershell
+.\build\ScreenTextify.exe --ocr path\to\image.png
 ```

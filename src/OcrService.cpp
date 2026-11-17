@@ -1,4 +1,5 @@
 #include "OcrService.h"
+#include "PaddleOcr.h"
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -218,6 +219,10 @@ bool HasHorizontalOverlapWithExistingWords(const OcrLineBox& line, const RectF& 
 } // namespace
 
 std::wstring OcrService::GetActiveLanguageName() {
+    if (PaddleOcr::EnsureInitialized()) {
+        return L"PP-OCRv4 Code Engine";
+    }
+
     static std::wstring s_cachedLang;
     if (!s_cachedLang.empty()) return s_cachedLang;
 
@@ -226,7 +231,7 @@ std::wstring OcrService::GetActiveLanguageName() {
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             OcrEngine engine = GetSharedOcrEngine();
             if (!engine) return L"Unavailable";
-            return std::wstring(engine.RecognizerLanguage().DisplayName().c_str());
+            return L"Windows OCR: " + std::wstring(engine.RecognizerLanguage().DisplayName().c_str());
         });
         s_cachedLang = future.get();
         return s_cachedLang;
@@ -235,7 +240,23 @@ std::wstring OcrService::GetActiveLanguageName() {
     }
 }
 
+std::wstring OcrService::GetLastEngineName() {
+    return PaddleOcr::IsAvailable() ? L"PP-OCRv4" : L"Windows OCR";
+}
+
 OcrDocument OcrService::RecognizeBitmap(const RawBitmap& bitmap, std::wstring* outError) {
+    auto startTime = std::chrono::steady_clock::now();
+    OcrDocument doc;
+    std::wstring paddleErr;
+    if (PaddleOcr::Recognize(bitmap, doc, &paddleErr)) {
+        doc.recognitionTimeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startTime).count();
+        return doc;
+    }
+    // Fallback: Windows.Media.Ocr pipeline (used only if the bundled engine is missing or failed)
+    return RecognizeWithWindowsOcr(bitmap, outError);
+}
+
+OcrDocument OcrService::RecognizeWithWindowsOcr(const RawBitmap& bitmap, std::wstring* outError) {
     OcrDocument doc;
     if (!bitmap.valid()) {
         if (outError) *outError = L"Invalid or empty bitmap passed to OCR.";

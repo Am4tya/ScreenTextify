@@ -199,10 +199,6 @@ std::wstring TextFormatter::FormatDocument(
                         ch = L'0';
                     }
                 }
-                size_t lmPos = token.find(L"lastmessage");
-                if (lmPos != std::wstring::npos) {
-                    token[lmPos + 4] = L'M';
-                }
             }
 
             if (wIdx > 0) {
@@ -216,8 +212,9 @@ std::wstring TextFormatter::FormatDocument(
                     wchar_t firstCh = token.front();
 
                     // If bounding boxes are visually touching (less than 45% of a character width),
-                    // they belong to the same programming token (e.g. "findOne(message?" + "._id)")
-                    if (gapPx < medianCharWidth * 0.45f) {
+                    // they belong to the same programming token (e.g. "findOne(message?" + "._id)"),
+                    // except ') {' which is always space-separated in block headers.
+                    if (gapPx < medianCharWidth * 0.45f && !(lastCh == L')' && firstCh == L'{')) {
                         shouldGlue = true;
                     }
                     // Member access / method chaining / optional chaining / parens where OCR split tokens

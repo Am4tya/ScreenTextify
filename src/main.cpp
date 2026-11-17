@@ -1,6 +1,7 @@
 #include "Types.h"
 #include "ScreenCapture.h"
 #include "OcrService.h"
+#include "PaddleOcr.h"
 #include "TextFormatter.h"
 #include "OverlayWindow.h"
 #include "HistoryWindow.h"
@@ -312,6 +313,67 @@ private:
     std::unique_ptr<HistoryWindow> m_historyWnd;
 };
 
+void WriteStdout(const std::wstring& outStr) {
+    HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!hStdOut || hStdOut == INVALID_HANDLE_VALUE) return;
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, outStr.c_str(), static_cast<int>(outStr.size()), nullptr, 0, nullptr, nullptr);
+    std::string utf8(static_cast<size_t>(utf8Len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, outStr.c_str(), static_cast<int>(outStr.size()), utf8.data(), utf8Len, nullptr, nullptr);
+    DWORD written = 0;
+    WriteFile(hStdOut, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+}
+
+void AttachParentConsole() {
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* fOut = nullptr;
+        if (GetStdHandle(STD_OUTPUT_HANDLE) == nullptr) {
+            freopen_s(&fOut, "CONOUT$", "w", stdout);
+            freopen_s(&fOut, "CONOUT$", "w", stderr);
+        }
+    }
+}
+
+// ScreenTextify.exe --ocr <image> [x y w h] [--scale N] [--win]
+// Prints the code-formatted OCR result of an image file (or a sub-rectangle of it).
+int RunOcrCli() {
+    AttachParentConsole();
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::wstring path;
+    std::vector<float> rect;
+    int scale = 0;
+    bool useWindows = false;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--ocr" && i + 1 < argc) { path = argv[++i]; }
+        else if (a == L"--scale" && i + 1 < argc) { scale = _wtoi(argv[++i]); }
+        else if (a == L"--win") { useWindows = true; }
+        else if (!a.empty() && (iswdigit(a[0]) || a[0] == L'.')) { rect.push_back(static_cast<float>(_wtof(a.c_str()))); }
+    }
+    LocalFree(argv);
+
+    RawBitmap img = ScreenCapture::LoadBitmapFromFile(path);
+    if (!img.valid()) {
+        WriteStdout(L"Could not load image: " + path + L"\r\n");
+        return 1;
+    }
+    RectF region{ 0.0f, 0.0f, static_cast<float>(img.width), static_cast<float>(img.height) };
+    if (rect.size() == 4) region = { rect[0], rect[1], rect[2], rect[3] };
+    if (scale <= 0) scale = (region.width < 950.0f && region.height < 600.0f) ? 2 : 1;
+
+    RawBitmap crop = ScreenCapture::CropAndScale(img, region, scale);
+    std::wstring err;
+    if (!useWindows) PaddleOcr::EnsureInitialized(&err);  // exclude one-time model loading from timing
+    OcrDocument doc = useWindows ? OcrService::RecognizeWithWindowsOcr(crop, &err) : OcrService::RecognizeBitmap(crop, &err);
+    std::wstringstream ss;
+    ss << L"[engine: " << (useWindows ? L"Windows OCR" : OcrService::GetLastEngineName())
+       << L", " << doc.recognitionTimeMs << L" ms, " << doc.totalWords() << L" words]\r\n";
+    if (!err.empty()) ss << L"[error: " << err << L"]\r\n";
+    ss << TextFormatter::FormatDocument(doc, false, true, nullptr) << L"\r\n";
+    WriteStdout(ss.str());
+    return 0;
+}
+
 int RunSelfTest(HINSTANCE hInstance) {
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         FILE* fOut = nullptr;
@@ -342,8 +404,8 @@ int RunSelfTest(HINSTANCE hInstance) {
     report << L"2. Active OCR Language: " << OcrService::GetActiveLanguageName() << L"\r\n";
 
     RawBitmap codeFrame = ScreenCapture::CreateSyntheticCodeFrame(800, 390);
-    RawBitmap upscaledFrame = ScreenCapture::CropAndScale(codeFrame, { 0.0f, 0.0f, 800.0f, 390.0f }, 3);
-    report << L"3. Generated 16-line VS Code Dark+ frame with #264F78 blue selection highlight (" << codeFrame.width << L"x" << codeFrame.height << L", 3x upscaled)\r\n";
+    RawBitmap upscaledFrame = ScreenCapture::CropAndScale(codeFrame, { 0.0f, 0.0f, 800.0f, 390.0f }, 2);
+    report << L"3. Generated 16-line VS Code Dark+ frame with #264F78 blue selection highlight (" << codeFrame.width << L"x" << codeFrame.height << L", 2x upscaled)\r\n";
 
     std::wstring err;
     OcrDocument doc = OcrService::RecognizeBitmap(upscaledFrame, &err);
@@ -371,28 +433,45 @@ int RunSelfTest(HINSTANCE hInstance) {
            << formattedCode << L"\r\n"
            << L"----------------------------------------\r\n";
 
-    // 3. Also test the untouched blue-highlighted and standalone brace crops from the user's screenshots
+    RawBitmap reactFrame = ScreenCapture::CreateSyntheticReactFrame(820, 300);
+    RawBitmap upscaledReact = ScreenCapture::CropAndScale(reactFrame, { 0.0f, 0.0f, 820.0f, 300.0f }, 2);
+    OcrDocument reactDoc = OcrService::RecognizeBitmap(upscaledReact, &err);
+    size_t reactWords = 0;
+    std::wstring formattedReact = TextFormatter::FormatDocument(reactDoc, false, true, &reactWords);
+    report << L"6. Reconstructed React Login.jsx Block (" << reactDoc.recognitionTimeMs << L" ms, " << reactWords << L" tokens):\r\n"
+           << L"----------------------------------------\r\n"
+           << formattedReact << L"\r\n"
+           << L"----------------------------------------\r\n";
+
+    // Test the untouched crops from the user's screenshots
     RawBitmap userShot2 = ScreenCapture::LoadBitmapFromFile(
         L"C:/Users/Admin/.gemini/antigravity/brain/9d56429c-94b7-4d98-b805-0cb32399cdc1/.user_uploaded/media_1794651879100_22c51b90.jpg"
     );
     if (userShot2.valid()) {
-        // Crop untouched '.populate("sender",' on blue selection background (x=96..268, y=226..243)
         RawBitmap senderCrop = ScreenCapture::CropAndScale(userShot2, { 96.0f, 226.0f, 172.0f, 17.0f }, 3);
         OcrDocument senderDoc = OcrService::RecognizeBitmap(senderCrop, &err);
-        report << L"6. User Screenshot #2 [.populate(\"sender\",] on Blue Highlight: "
+        report << L"7. User Screenshot #2 [.populate(\"sender\",] on Blue Highlight: "
                << TextFormatter::FormatDocument(senderDoc, false, true, nullptr) << L"\r\n";
 
-        // Crop untouched '(message?._id)' on blue selection background (x=489..608, y=202..223)
         RawBitmap msgIdCrop = ScreenCapture::CropAndScale(userShot2, { 489.0f, 202.0f, 119.0f, 21.0f }, 3);
         OcrDocument msgIdDoc = OcrService::RecognizeBitmap(msgIdCrop, &err);
-        report << L"7. User Screenshot #2 [(message?._id)] on Blue Highlight: "
+        report << L"8. User Screenshot #2 [(message?._id)] on Blue Highlight: "
                << TextFormatter::FormatDocument(msgIdDoc, false, true, nullptr) << L"\r\n";
 
-        // Crop untouched standalone '}' and '};' lines (x=42..97, y=374..426)
         RawBitmap bracesCrop = ScreenCapture::CropAndScale(userShot2, { 42.0f, 374.0f, 55.0f, 52.0f }, 3);
         OcrDocument bracesDoc = OcrService::RecognizeBitmap(bracesCrop, &err);
-        report << L"8. User Screenshot #2 Standalone Braces [} and };]:\r\n"
+        report << L"9. User Screenshot #2 Standalone Braces [} and };]:\r\n"
                << TextFormatter::FormatDocument(bracesDoc, false, true, nullptr) << L"\r\n";
+    }
+
+    RawBitmap userShot3 = ScreenCapture::LoadBitmapFromFile(
+        L"C:/Users/Admin/.gemini/antigravity/brain/9d56429c-94b7-4d98-b805-0cb32399cdc1/.user_uploaded/media_1794894842461_27ef79e7.jpg"
+    );
+    if (userShot3.valid()) {
+        RawBitmap importsCrop = ScreenCapture::CropAndScale(userShot3, { 80.0f, 58.0f, 470.0f, 70.0f }, 2);
+        OcrDocument importsDoc = OcrService::RecognizeBitmap(importsCrop, &err);
+        report << L"10. User Screenshot #3 Dimmed Imports (" << importsDoc.recognitionTimeMs << L" ms):\r\n"
+               << TextFormatter::FormatDocument(importsDoc, false, true, nullptr) << L"\r\n";
     }
 
     report << L"=== ALL GUI & OCR SELF-TESTS PASSED ===\r\n";
@@ -418,9 +497,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
+    if (cmdLine.find(L"--ocr") != std::wstring::npos) {
+        return ScreenTextify::RunOcrCli();
+    }
     if (cmdLine.find(L"--self-test") != std::wstring::npos) {
         return ScreenTextify::RunSelfTest(hInstance);
     }
+
+    // Load the OCR models in the background so the first capture is instant
+    ScreenTextify::PaddleOcr::WarmUpAsync();
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     (void)hr;

@@ -33,6 +33,9 @@ public:
     // Creates a synthetic dark-mode video code frame for self-testing OCR and indentation
     static RawBitmap CreateSyntheticCodeFrame(int width = 800, int height = 420);
 
+    // Creates a synthetic React JSX component frame matching the user's Login.jsx video
+    static RawBitmap CreateSyntheticReactFrame(int width = 820, int height = 340);
+
     // Loads an image file (PNG/JPG/BMP) into a RawBitmap using GDI+
     static RawBitmap LoadBitmapFromFile(const std::wstring& filePath);
 };

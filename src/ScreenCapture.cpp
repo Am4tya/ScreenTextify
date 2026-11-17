@@ -247,6 +247,94 @@ RawBitmap ScreenCapture::CreateSyntheticCodeFrame(int width, int height) {
     return result;
 }
 
+RawBitmap ScreenCapture::CreateSyntheticReactFrame(int width, int height) {
+    RawBitmap result;
+    HDC hScreenDC = GetDC(nullptr);
+    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = nullptr;
+    HBITMAP hDib = CreateDIBSection(hScreenDC, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    HGDIOBJ hOldBmp = SelectObject(hMemDC, hDib);
+
+    RECT rc = { 0, 0, width, height };
+    HBRUSH hBg = CreateSolidBrush(RGB(20, 22, 27));
+    FillRect(hMemDC, &rc, hBg);
+    DeleteObject(hBg);
+
+    HFONT hFont = CreateFontW(
+        -15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas"
+    );
+    HGDIOBJ hOldFont = SelectObject(hMemDC, hFont);
+    SetBkMode(hMemDC, TRANSPARENT);
+
+    struct ColoredToken {
+        const wchar_t* text;
+        COLORREF color;
+    };
+    auto drawTokenLine = [&](int x, int y, const std::vector<ColoredToken>& tokens) {
+        int curX = x;
+        for (const auto& tk : tokens) {
+            SetTextColor(hMemDC, tk.color);
+            TextOutW(hMemDC, curX, y, tk.text, static_cast<int>(wcslen(tk.text)));
+            SIZE sz = {};
+            GetTextExtentPoint32W(hMemDC, tk.text, static_cast<int>(wcslen(tk.text)), &sz);
+            curX += sz.cx;
+        }
+    };
+
+    COLORREF cPurple = RGB(197, 134, 192);
+    COLORREF cBlue   = RGB(86, 156, 214);
+    COLORREF cCyan   = RGB(156, 220, 254);
+    COLORREF cYellow = RGB(220, 220, 170);
+    COLORREF cOrange = RGB(206, 145, 120);
+    COLORREF cGreen  = RGB(181, 206, 168);
+    COLORREF cWhite  = RGB(212, 212, 212);
+    COLORREF cGold   = RGB(255, 215, 0);
+    COLORREF cGray   = RGB(128, 128, 128);
+
+    drawTokenLine(24, 16,  { { L"const ", cBlue }, { L"Login ", cYellow }, { L"= ", cWhite }, { L"() ", cGold }, { L"=> ", cBlue }, { L"{", cGold } });
+    drawTokenLine(24, 38,  { { L"  const ", cBlue }, { L"{", cPurple }, { L"step,setStep,setUserPhoneData,userPhoneData,resetLoginState", cCyan }, { L"} = ", cWhite }, { L"useLoginStore", cYellow }, { L"();", cPurple } });
+    drawTokenLine(24, 60,  { { L"  const ", cBlue }, { L"[", cPurple }, { L"phoneNumber,setPhoneNumber", cCyan }, { L"] = ", cWhite }, { L"useState", cYellow }, { L"(", cPurple }, { L"\"\"", cOrange }, { L");", cPurple } });
+    drawTokenLine(24, 82,  { { L"  const ", cBlue }, { L"[", cPurple }, { L"selectedCountry,setSelectedCountry", cCyan }, { L"] = ", cWhite }, { L"useState", cYellow }, { L"(", cPurple }, { L"countries", cCyan }, { L"[", cBlue }, { L"0", cGreen }, { L"]);", cPurple } });
+    drawTokenLine(24, 104, { { L"  const ", cBlue }, { L"[", cPurple }, { L"otp,setOtp", cCyan }, { L"] = ", cWhite }, { L"useState", cYellow }, { L"([", cPurple }, { L"\"\", \"\", \"\", \"\", \"\", \"\"", cOrange }, { L"])", cPurple } });
+    drawTokenLine(24, 126, { { L"  const ", cBlue }, { L"[", cPurple }, { L"email,setEmail", cCyan }, { L"] = ", cWhite }, { L"useState", cYellow }, { L"(", cPurple }, { L"\"\"", cOrange }, { L")", cPurple } });
+    drawTokenLine(24, 148, { { L"  return ", cPurple }, { L"(", cPurple } });
+    drawTokenLine(24, 170, { { L"    <", cGray }, { L"div", cBlue }, { L">", cGray }, { L"Login", cWhite }, { L"</", cGray }, { L"div", cBlue }, { L">", cGray } });
+    drawTokenLine(24, 192, { { L"  )", cPurple } });
+    drawTokenLine(24, 214, { { L"}", cGold } });
+    drawTokenLine(24, 258, { { L"export ", cPurple }, { L"default ", cPurple }, { L"Login", cYellow } });
+
+    GdiFlush();
+
+    result.width = width;
+    result.height = height;
+    result.stride = width * 4;
+    result.pixels.resize(static_cast<size_t>(width) * height * 4);
+    memcpy(result.pixels.data(), pBits, result.pixels.size());
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+        result.pixels[i * 4 + 3] = 255;
+    }
+
+    SelectObject(hMemDC, hOldFont);
+    DeleteObject(hFont);
+    SelectObject(hMemDC, hOldBmp);
+    DeleteObject(hDib);
+    DeleteDC(hMemDC);
+    ReleaseDC(nullptr, hScreenDC);
+
+    return result;
+}
+
 RawBitmap ScreenCapture::LoadBitmapFromFile(const std::wstring& filePath) {
     RawBitmap result;
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;

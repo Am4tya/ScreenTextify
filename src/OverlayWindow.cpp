@@ -182,9 +182,9 @@ void OverlayWindow::RunOcrOnRegion(const RectF& localRegion) {
 
     int scale = 1;
     if (m_settings && m_settings->upscaleForOcr) {
-        if (norm.width < 950.0f && norm.height < 600.0f) {
+        if (norm.width < 320.0f && norm.height < 120.0f) {
             scale = 3;
-        } else if (norm.width < 1700.0f && norm.height < 1050.0f) {
+        } else if (norm.width < 1500.0f && norm.height < 950.0f) {
             scale = 2;
         }
     }
