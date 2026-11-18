@@ -54,5 +54,7 @@ add_custom_command(TARGET ScreenTextify POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${MODELS_DIR}/rec_en.onnx
         ${MODELS_DIR}/en_dict.txt
+        ${MODELS_DIR}/rec_en_v5.onnx
+        ${MODELS_DIR}/rec_en_v5_dict.txt
         $<TARGET_FILE_DIR:ScreenTextify>/models
 )

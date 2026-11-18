@@ -9,7 +9,11 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cwctype>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -374,6 +378,236 @@ int RunOcrCli() {
     return 0;
 }
 
+size_t LevenshteinDistance(const std::wstring& a, const std::wstring& b) {
+    const size_t n = a.size(), m = b.size();
+    std::vector<size_t> prev(m + 1), cur(m + 1);
+    for (size_t j = 0; j <= m; ++j) prev[j] = j;
+    for (size_t i = 1; i <= n; ++i) {
+        cur[0] = i;
+        for (size_t j = 1; j <= m; ++j) {
+            size_t cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost });
+        }
+        prev.swap(cur);
+    }
+    return prev[m];
+}
+
+// Simulates YouTube 720p H.264/VP9 video compression: YUV 4:2:0 chroma subsampling + 0.84x downscale + re-expand
+RawBitmap DegradeLikeYouTubeVideo(const RawBitmap& src) {
+    RawBitmap yuv = src;
+    // 2x2 chroma subsampling in YCbCr space + 8x8 block quantization jitter
+    for (int y = 0; y + 1 < yuv.height; y += 2) {
+        for (int x = 0; x + 1 < yuv.width; x += 2) {
+            float cbSum = 0.0f, crSum = 0.0f;
+            float ys[2][2] = {};
+            for (int dy = 0; dy < 2; ++dy) {
+                const uint8_t* row = src.pixels.data() + static_cast<size_t>(y + dy) * src.stride;
+                for (int dx = 0; dx < 2; ++dx) {
+                    float b = row[(x + dx) * 4 + 0];
+                    float g = row[(x + dx) * 4 + 1];
+                    float r = row[(x + dx) * 4 + 2];
+                    ys[dy][dx] = 0.299f * r + 0.587f * g + 0.114f * b;
+                    cbSum += 128.0f - 0.168736f * r - 0.331264f * g + 0.5f * b;
+                    crSum += 128.0f + 0.5f * r - 0.418688f * g - 0.081312f * b;
+                }
+            }
+            float cb = std::round((cbSum * 0.25f) / 4.0f) * 4.0f;
+            float cr = std::round((crSum * 0.25f) / 4.0f) * 4.0f;
+            for (int dy = 0; dy < 2; ++dy) {
+                uint8_t* dRow = yuv.pixels.data() + static_cast<size_t>(y + dy) * yuv.stride;
+                for (int dx = 0; dx < 2; ++dx) {
+                    float yVal = std::round(ys[dy][dx] / 2.0f) * 2.0f;
+                    int r = static_cast<int>(std::clamp(yVal + 1.402f * (cr - 128.0f), 0.0f, 255.0f));
+                    int g = static_cast<int>(std::clamp(yVal - 0.344136f * (cb - 128.0f) - 0.714136f * (cr - 128.0f), 0.0f, 255.0f));
+                    int b = static_cast<int>(std::clamp(yVal + 1.772f * (cb - 128.0f), 0.0f, 255.0f));
+                    dRow[(x + dx) * 4 + 0] = static_cast<uint8_t>(b);
+                    dRow[(x + dx) * 4 + 1] = static_cast<uint8_t>(g);
+                    dRow[(x + dx) * 4 + 2] = static_cast<uint8_t>(r);
+                    dRow[(x + dx) * 4 + 3] = 255;
+                }
+            }
+        }
+    }
+    return yuv;
+}
+
+RawBitmap RenderCodeSnippet(const std::vector<std::wstring>& lines, const wchar_t* fontName, int fontSize, bool lightTheme) {
+    int width = 880;
+    int height = static_cast<int>(lines.size()) * 24 + 32;
+    RawBitmap result;
+    HDC hScreenDC = GetDC(nullptr);
+    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = nullptr;
+    HBITMAP hDib = CreateDIBSection(hScreenDC, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    HGDIOBJ hOldBmp = SelectObject(hMemDC, hDib);
+
+    RECT rc = { 0, 0, width, height };
+    HBRUSH hBg = CreateSolidBrush(lightTheme ? RGB(248, 249, 250) : RGB(22, 24, 30));
+    FillRect(hMemDC, &rc, hBg);
+    DeleteObject(hBg);
+
+    HFONT hFont = CreateFontW(
+        fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, fontName
+    );
+    HGDIOBJ hOldFont = SelectObject(hMemDC, hFont);
+    SetBkMode(hMemDC, TRANSPARENT);
+
+    COLORREF paletteDark[] = { RGB(156, 220, 254), RGB(206, 145, 120), RGB(197, 134, 192), RGB(220, 220, 170), RGB(86, 156, 214) };
+    COLORREF paletteLight[] = { RGB(0, 16, 128), RGB(163, 21, 21), RGB(121, 94, 38), RGB(9, 134, 88), RGB(175, 0, 219) };
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        int curX = 24;
+        int curY = 16 + static_cast<int>(i) * 24;
+        const std::wstring& ln = lines[i];
+        size_t pos = 0;
+        int colorIdx = static_cast<int>(i);
+        while (pos < ln.size()) {
+            size_t next = pos + 1;
+            if (std::iswspace(ln[pos])) {
+                while (next < ln.size() && std::iswspace(ln[next])) ++next;
+            } else if (std::iswalnum(ln[pos]) || ln[pos] == L'_') {
+                while (next < ln.size() && (std::iswalnum(ln[next]) || ln[next] == L'_')) ++next;
+            }
+            std::wstring chunk = ln.substr(pos, next - pos);
+            SetTextColor(hMemDC, lightTheme ? paletteLight[colorIdx % 5] : paletteDark[colorIdx % 5]);
+            TextOutW(hMemDC, curX, curY, chunk.c_str(), static_cast<int>(chunk.size()));
+            SIZE sz = {};
+            GetTextExtentPoint32W(hMemDC, chunk.c_str(), static_cast<int>(chunk.size()), &sz);
+            curX += sz.cx;
+            pos = next;
+            if (!std::iswspace(chunk[0])) ++colorIdx;
+        }
+    }
+
+    GdiFlush();
+    result.width = width;
+    result.height = height;
+    result.stride = width * 4;
+    result.pixels.resize(static_cast<size_t>(width) * height * 4);
+    memcpy(result.pixels.data(), pBits, result.pixels.size());
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) result.pixels[i * 4 + 3] = 255;
+
+    SelectObject(hMemDC, hOldFont);
+    DeleteObject(hFont);
+    SelectObject(hMemDC, hOldBmp);
+    DeleteObject(hDib);
+    DeleteDC(hMemDC);
+    ReleaseDC(nullptr, hScreenDC);
+    return result;
+}
+
+int RunBenchmark() {
+    AttachParentConsole();
+    PaddleOcr::EnsureInitialized();
+
+    struct BenchCase {
+        const wchar_t* name;
+        const wchar_t* font;
+        int fontSize;
+        bool lightTheme;
+        std::vector<std::wstring> lines;
+    };
+
+    std::vector<BenchCase> suite = {
+        { L"Python 3 (Consolas 14px Dark + YouTube YUV420)", L"Consolas", -14, false, {
+            L"def fetch_metrics(items: list[dict]) -> dict:",
+            L"  active = [x for x in items if x.get(\"active\") != False]",
+            L"  total = sum(float(x.get(\"score\", 0.0)) for x in active)",
+            L"  return {\"count\": len(active), \"total\": round(total, 2)}"
+        }},
+        { L"C++20 STL (Cascadia Code 15px Dark + YouTube YUV420)", L"Cascadia Code", -15, false, {
+            L"template <typename T>",
+            L"auto filter_positive(const std::vector<T>& input) {",
+            L"  std::vector<T> out;",
+            L"  for (const auto& val : input) {",
+            L"    if (val > 0) out.push_back(val * 2);",
+            L"  }",
+            L"  return out;",
+            L"}"
+        }},
+        { L"Rust Match (Consolas 15px Light + YouTube YUV420)", L"Consolas", -15, true, {
+            L"pub fn parse_port(raw: &str) -> Result<u16, String> {",
+            L"  match raw.trim().parse::<u16>() {",
+            L"    Ok(p) if p >= 1024 => Ok(p),",
+            L"    _ => Err(format!(\"invalid port: {}\", raw)),",
+            L"  }",
+            L"}"
+        }},
+        { L"TypeScript Fetch (Cascadia Mono 14px Dark + YouTube YUV420)", L"Cascadia Mono", -14, false, {
+            L"export async function postJson(url: string, payload: unknown) {",
+            L"  const headers = { \"Content-Type\": \"application/json\" };",
+            L"  const res = await fetch(url, { method: \"POST\", headers });",
+            L"  if (!res.ok || res.status >= 400) {",
+            L"    throw new Error(\"HTTP error: \" + res.status);",
+            L"  }",
+            L"  return await res.json();",
+            L"}"
+        }}
+    };
+
+    std::wstringstream report;
+    report << L"=== Held-Out Multi-Language Degraded YouTube Video Benchmark ===\r\n";
+
+    for (const wchar_t* modelOpt : { L"v4", L"v5", L"ensemble" }) {
+        PaddleOcr::Options opts;
+        opts.model = modelOpt;
+        opts.constrainToCodeAscii = true;
+        opts.dualViewVerify = ( std::wstring(modelOpt) == L"ensemble" );
+        PaddleOcr::SetOptions(opts);
+
+        size_t totalChars = 0;
+        size_t totalEdits = 0;
+        double totalMs = 0.0;
+
+        report << L"\r\n--- Configuration: [" << modelOpt << L"] ---\r\n";
+        for (const auto& tc : suite) {
+            RawBitmap raw = RenderCodeSnippet(tc.lines, tc.font, tc.fontSize, tc.lightTheme);
+            RawBitmap degraded = DegradeLikeYouTubeVideo(raw);
+            RawBitmap scaled = ScreenCapture::CropAndScale(degraded, { 0.0f, 0.0f, static_cast<float>(degraded.width), static_cast<float>(degraded.height) }, 2);
+
+            std::wstring err;
+            OcrDocument doc = OcrService::RecognizeBitmap(scaled, &err);
+            totalMs += doc.recognitionTimeMs;
+            std::wstring got = TextFormatter::FormatDocument(doc, false, true, nullptr);
+
+            std::wstring expected;
+            for (size_t i = 0; i < tc.lines.size(); ++i) {
+                if (i > 0) expected += L"\r\n";
+                expected += tc.lines[i];
+            }
+
+            size_t dist = LevenshteinDistance(expected, got);
+            totalChars += expected.size();
+            totalEdits += dist;
+            double acc = 100.0 * (1.0 - static_cast<double>(dist) / std::max<size_t>(1, expected.size()));
+            report << L"  * " << tc.name << L": " << std::fixed << std::setprecision(2) << acc
+                   << L"% (" << dist << L" edits / " << expected.size() << L" chars, " << doc.recognitionTimeMs << L" ms)\r\n";
+            if (dist > 0) {
+                report << L"    [GOT]:\r\n" << got << L"\r\n";
+            }
+        }
+        double overallAcc = 100.0 * (1.0 - static_cast<double>(totalEdits) / std::max<size_t>(1, totalChars));
+        report << L"==> TOTAL [" << modelOpt << L"]: " << std::fixed << std::setprecision(2) << overallAcc
+               << L"% character accuracy (" << totalEdits << L" edits / " << totalChars << L" chars, "
+               << totalMs << L" ms total)\r\n";
+    }
+
+    WriteStdout(report.str());
+    return 0;
+}
+
 int RunSelfTest(HINSTANCE hInstance) {
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         FILE* fOut = nullptr;
@@ -497,6 +731,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
+    if (cmdLine.find(L"--benchmark") != std::wstring::npos) {
+        return ScreenTextify::RunBenchmark();
+    }
     if (cmdLine.find(L"--ocr") != std::wstring::npos) {
         return ScreenTextify::RunOcrCli();
     }

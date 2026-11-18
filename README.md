@@ -12,11 +12,11 @@
   1. **Interactive Region Selectext (`Alt + Shift + S`)**: Freeze any video/image region and click or drag over highlighted word/line boxes to copy on mouse release.
   2. **Instant Full-Screen Selectext (`Alt + Shift + D`)**: Immediately freezes and detects all selectable text across the active monitor.
   3. **Quick Snip & Instant Copy (`Alt + Shift + C`)**: Drag a rectangle over any text/code to immediately OCR and copy all of it in a single step.
-- **Hybrid PP-OCRv4 Code Engine (`PaddleOcr` on ONNX Runtime + `Windows.Media.Ocr` Fallback)**:
+- **PP-OCRv5 + v4 Dual-View Code Engine (`PaddleOcr` on ONNX Runtime + `Windows.Media.Ocr` Fallback)**:
   - **Horizontal-Strip 25th-Percentile Background Estimator**: Eliminates editor selection highlights (e.g., VS Code `#264F78` blue selection boxes), diff lines, and dimmed video overlays with zero vertical bleed across line boundaries.
   - **2D 8-Connected Component Line & Clause Detector (~0.3 ms)**: Finds exact pixel-tight bounding boxes of every code line and standalone symbol (`{`, `}`, `};`, `(`, `)`), avoiding the ~500 ms overhead and symbol-dropping of scene-photo text detectors.
-  - **Character-Level `SVTR-LCNet` Neural Recognition (`rec_en.onnx`)**: Decodes all 95 printable ASCII characters (including `=>`, `<div>`, `""`, `[0]`, `{step,setStep,...}`) directly on CPU.
-  - **Pushdown Automaton (PDA) Delimiter Stack & Topological Verifier**: Tracks open `{` and `(` delimiters across lines to disambiguate standalone closing `)` vs `}`, recovers CTC-collapsed empty strings (`""`), and verifies `=` vs `-` via vertical scanline bar profiles.
+  - **ASCII-Constrained CTC Decoding & Word-Level Confidence Ensemble (`rec_en_v5.onnx` + `rec_en.onnx`)**: Combines PP-OCRv5's digit/symbol recognition head (including dotted `0` in `Cascadia Code`) with PP-OCRv4's camelCase retention (`useState`, `useLoginStore`) and a secondary polarity-normalized raw view.
+  - **Keyword-Free 2-Bar `=` Verifier & Pushdown Automaton (PDA) Delimiter Stack**: Distinguishes two stacked horizontal bars (`=`) from `-` via connected-component topology, tracks open `{` and `(` delimiters across lines to disambiguate standalone closing `)` vs `}`, and recovers CTC-collapsed empty strings (`""`).
 - **Smart Code Indentation Reconstruction**:
   - Clusters words and vertically overlapping punctuation into visual lines, calculates median character width, normalizes monospace slashed zeros (`ø` → `0`), glues split sub-tokens, and reconstructs 2/4/8-space code indentation and blank lines.
 
@@ -53,6 +53,11 @@ Launch the executable:
 Run the automated GUI & OCR verification suite:
 ```powershell
 .\build\ScreenTextify.exe --self-test | Out-String
+```
+
+Run the held-out multi-language degraded YouTube video benchmark:
+```powershell
+.\build\ScreenTextify.exe --benchmark | Out-String
 ```
 
 Run CLI OCR on any image file (or crop `[x y w h]`):

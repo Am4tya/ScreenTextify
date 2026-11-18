@@ -1,14 +1,14 @@
-// PaddleOcr.cpp — High-Speed PP-OCRv4 (8-Connected Component Line Detector + SVTR-LCNet + PDA Bracket Verifier)
+// PaddleOcr.cpp — PP-OCRv5 + PP-OCRv4 Dual-Model / Dual-View Code Engine on ONNX Runtime (CPU).
 //
-// Architecture:
-//   1. Horizontal-Strip 25th-Percentile Background Estimator & Multi-Channel Contrast Equalizer (~2 ms)
-//      converts multi-hue syntax highlighting, #264F78 blue selection highlights, and dimmed video frames
-//      into crisp black ink on a pure white (255) background.
-//   2. 8-Connected Component Row & Clause Clustering (~0.3 ms) replaces slow scene-photo DBNet detection,
-//      guaranteeing that standalone symbols ('{', '}', '(', ')', '};') and edge punctuation ('.populate',
-//      '=> {', 'return (', '"",') are never dropped, clipped, or duplicated.
-//   3. Padded SVTR-LCNet recognition + Pushdown Automaton (PDA) delimiter stack & topological curvature
-//      verification.
+// Key capabilities for copying code from compressed YouTube videos & images:
+//   1. Horizontal-Strip 25th-Percentile Background Estimator + Unsharp-Masked Contrast Equalizer (~2 ms)
+//      plus a parallel polarity-normalized raw view for dual-view confidence verification.
+//   2. 2D 8-Connected Component Row & Clause Detector (~0.3 ms) that captures 100% of standalone
+//      braces/parens ('{', '}', '(', ')', '};') and edge punctuation without scene-photo DBNet drops.
+//   3. ASCII-Constrained CTC Decoding across PP-OCRv5 (rec_en_v5.onnx) and PP-OCRv4 (rec_en.onnx),
+//      automatically cross-checking low-confidence lines across both models and views.
+//   4. Keyword-free 2-Bar Connected-Component '=' Verifier, 5-Zone Curvature Classifier, and
+//      Pushdown Automaton (PDA) Delimiter Stack.
 
 #define ORT_API_MANUAL_INIT
 #include <onnxruntime_cxx_api.h>
@@ -34,21 +34,38 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr int kRecHeight   = 48;     // PP-OCRv4 recognizer input height
+constexpr int kRecHeight   = 48;     // PP-OCRv4 / PP-OCRv5 recognizer input height
 constexpr int kRecMinWidth = 48;
 constexpr int kRecMaxWidth = 3200;
 
+struct Recognizer {
+    std::wstring name;
+    Ort::Session session{ nullptr };
+    std::string inName, outName;
+    std::vector<std::wstring> alphabet;  // index 0 = CTC blank
+    std::vector<int> allowed;            // class indices decodable to code ASCII (0 = blank included)
+    std::vector<wchar_t> asciiOf;        // class index -> ASCII character (0 = disallowed)
+};
+
 struct Engine {
     Ort::Env env{ nullptr };
-    Ort::Session rec{ nullptr };
-    std::string recIn, recOut;
-    std::vector<std::wstring> alphabet;  // index 0 = CTC blank
+    Ort::SessionOptions opts{ nullptr };
+    std::vector<std::unique_ptr<Recognizer>> recs;
+
+    Recognizer* Find(const std::wstring& n) const {
+        for (const auto& r : recs) {
+            if (r->name == n) return r.get();
+        }
+        return nullptr;
+    }
 };
 
 Engine* g_engine = nullptr;
 std::once_flag g_initOnce;
 std::atomic<bool> g_ready{ false };
 std::wstring g_initError;
+PaddleOcr::Options g_options;
+std::mutex g_optMutex;
 
 fs::path ExeDir() {
     wchar_t buf[MAX_PATH * 2] = {};
@@ -64,18 +81,82 @@ std::wstring Utf8ToWide(const std::string& s) {
     return w;
 }
 
+std::vector<std::wstring> ReadDictLines(const fs::path& dictPath) {
+    std::ifstream f(dictPath, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<std::wstring> lines;
+    size_t start = 0;
+    while (start <= content.size()) {
+        size_t nl = content.find('\n', start);
+        std::string line = content.substr(start, (nl == std::string::npos ? content.size() : nl) - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (nl == std::string::npos) {
+            if (!line.empty()) lines.push_back(Utf8ToWide(line));
+            break;
+        }
+        lines.push_back(Utf8ToWide(line));
+        start = nl + 1;
+    }
+    return lines;
+}
+
+// Maps typographic look-alikes that recognizers emit for code glyphs back to standard ASCII.
+wchar_t ToCodeAscii(wchar_t c) {
+    if (c >= 0x20 && c <= 0x7E) return c;
+    if (c >= 0xFF01 && c <= 0xFF5E) return static_cast<wchar_t>(c - 0xFEE0);
+    switch (c) {
+    case 0x2018: case 0x2019: case 0x201A: case 0x201B: case 0x2032: case 0x00B4: return L'\'';
+    case 0x201C: case 0x201D: case 0x201E: case 0x201F: case 0x2033: return L'"';
+    case 0x2010: case 0x2011: case 0x2012: case 0x2212: return L'-';
+    case 0x2024: case 0x00B7: case 0x2219: case 0x22C5: return L'.';
+    case 0x2236: return L':';
+    case 0x2215: return L'/';
+    case 0x2217: return L'*';
+    case 0x223C: return L'~';
+    default: return 0;
+    }
+}
+
+std::unique_ptr<Recognizer> LoadRecognizer(Engine& e, const std::wstring& name, const fs::path& model, const fs::path& dict) {
+    auto r = std::make_unique<Recognizer>();
+    r->name = name;
+    r->session = Ort::Session(e.env, model.c_str(), e.opts);
+    Ort::AllocatorWithDefaultOptions alloc;
+    r->inName = r->session.GetInputNameAllocated(0, alloc).get();
+    r->outName = r->session.GetOutputNameAllocated(0, alloc).get();
+
+    auto outShape = r->session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+    int64_t numClasses = outShape.empty() ? -1 : outShape.back();
+
+    r->alphabet.push_back(L"");  // CTC blank at index 0
+    for (auto& l : ReadDictLines(dict)) r->alphabet.push_back(l);
+    if (numClasses > 0) {
+        while (static_cast<int64_t>(r->alphabet.size()) < numClasses) r->alphabet.push_back(L" ");
+        if (static_cast<int64_t>(r->alphabet.size()) > numClasses) r->alphabet.resize(static_cast<size_t>(numClasses));
+    } else {
+        r->alphabet.push_back(L" ");
+    }
+
+    r->asciiOf.assign(r->alphabet.size(), 0);
+    r->allowed.push_back(0);
+    for (size_t i = 1; i < r->alphabet.size(); ++i) {
+        const std::wstring& s = r->alphabet[i];
+        if (s.size() != 1) continue;
+        wchar_t a = ToCodeAscii(s[0]);
+        if (a == 0) continue;
+        r->asciiOf[i] = a;
+        r->allowed.push_back(static_cast<int>(i));
+    }
+    return r;
+}
+
 void DoInitialize() {
     try {
         const fs::path dir = ExeDir();
         const fs::path dll = dir / L"onnxruntime.dll";
-        const fs::path recPath = dir / L"models" / L"rec_en.onnx";
-        const fs::path dictPath = dir / L"models" / L"en_dict.txt";
-
-        for (const auto& p : { dll, recPath, dictPath }) {
-            if (!fs::exists(p)) {
-                g_initError = L"Missing OCR component: " + p.wstring();
-                return;
-            }
+        if (!fs::exists(dll)) {
+            g_initError = L"Missing OCR component: " + dll.wstring();
+            return;
         }
 
         HMODULE hOrt = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -99,46 +180,28 @@ void DoInitialize() {
         auto engine = std::make_unique<Engine>();
         engine->env = Ort::Env(ORT_LOGGING_LEVEL_ERROR, "ScreenTextify");
 
-        Ort::SessionOptions opts;
+        engine->opts = Ort::SessionOptions();
         unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        opts.SetIntraOpNumThreads(static_cast<int>(std::clamp(hw / 2u, 2u, 8u)));
-        opts.SetInterOpNumThreads(1);
-        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        engine->opts.SetIntraOpNumThreads(static_cast<int>(std::clamp(hw / 2u, 2u, 8u)));
+        engine->opts.SetInterOpNumThreads(1);
+        engine->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        engine->opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
-        engine->rec = Ort::Session(engine->env, recPath.c_str(), opts);
-
-        Ort::AllocatorWithDefaultOptions alloc;
-        engine->recIn = engine->rec.GetInputNameAllocated(0, alloc).get();
-        engine->recOut = engine->rec.GetOutputNameAllocated(0, alloc).get();
-
-        std::ifstream f(dictPath, std::ios::binary);
-        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        std::vector<std::wstring> lines;
-        size_t start = 0;
-        while (start <= content.size()) {
-            size_t nl = content.find('\n', start);
-            std::string line = content.substr(start, (nl == std::string::npos ? content.size() : nl) - start);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (nl == std::string::npos) {
-                if (!line.empty()) lines.push_back(Utf8ToWide(line));
-                break;
+        struct Cand { const wchar_t* name; const wchar_t* model; const wchar_t* dict; };
+        const Cand cands[] = {
+            { L"v5", L"rec_en_v5.onnx", L"rec_en_v5_dict.txt" },
+            { L"v4", L"rec_en.onnx",    L"en_dict.txt" },
+        };
+        for (const auto& c : cands) {
+            fs::path m = dir / L"models" / c.model;
+            fs::path d = dir / L"models" / c.dict;
+            if (fs::exists(m) && fs::exists(d)) {
+                engine->recs.push_back(LoadRecognizer(*engine, c.name, m, d));
             }
-            lines.push_back(Utf8ToWide(line));
-            start = nl + 1;
         }
-
-        auto outShape = engine->rec.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-        int64_t numClasses = outShape.empty() ? -1 : outShape.back();
-
-        engine->alphabet.clear();
-        engine->alphabet.push_back(L"");  // CTC blank at index 0
-        for (auto& l : lines) engine->alphabet.push_back(l);
-        if (numClasses > 0) {
-            while (static_cast<int64_t>(engine->alphabet.size()) < numClasses) engine->alphabet.push_back(L" ");
-            if (static_cast<int64_t>(engine->alphabet.size()) > numClasses) engine->alphabet.resize(static_cast<size_t>(numClasses));
-        } else {
-            engine->alphabet.push_back(L" ");
+        if (engine->recs.empty()) {
+            g_initError = L"No recognition model found in " + (dir / L"models").wstring();
+            return;
         }
 
         g_engine = engine.release();
@@ -151,22 +214,26 @@ void DoInitialize() {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Step 1: Contrast-Equalized Black-on-White Image + 8-Connected Component Ink Mask
+// Step 1: Dual-View Preprocessing + 8-Connected Component Ink Mask
 // ------------------------------------------------------------------------------------------------
 
 struct InkComponent {
     int minX = 0, minY = 0, maxX = 0, maxY = 0;
     int pixelCount = 0;
-    float topMeanX = 0.0f;
-    float midMeanX = 0.0f;
-    float botMeanX = 0.0f;
+    float topMeanX = 0.0f;    // relY in [0.00, 0.22]
+    float upStemX  = 0.0f;    // relY in [0.22, 0.40]
+    float midMeanX = 0.0f;    // relY in [0.40, 0.60]
+    float loStemX  = 0.0f;    // relY in [0.60, 0.78]
+    float botMeanX = 0.0f;    // relY in [0.78, 1.00]
     int width() const { return maxX - minX + 1; }
     int height() const { return maxY - minY + 1; }
+    float centerX() const { return 0.5f * (minX + maxX); }
     float centerY() const { return 0.5f * (minY + maxY); }
 };
 
 struct PreprocessedFrame {
-    RawBitmap cleanBmp;              // Contrast-equalized black-ink-on-white BGRA8 bitmap
+    RawBitmap cleanBmp;              // Contrast-equalized + sharpened black-on-white BGRA8 bitmap
+    RawBitmap rawNormBmp;            // Polarity-normalized direct BGR view (for dual-view verification)
     std::vector<uint8_t> inkMask;    // 1 where foreground glyph ink is present
     std::vector<InkComponent> comps; // Filtered glyph connected components
     float medGlyphH = 18.0f;
@@ -186,6 +253,8 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
     pf.cleanBmp.screenOriginX = src.screenOriginX;
     pf.cleanBmp.screenOriginY = src.screenOriginY;
     pf.cleanBmp.pixels.resize(totalPixels * 4, 255);
+
+    pf.rawNormBmp = pf.cleanBmp;
     pf.inkMask.assign(totalPixels, 0);
 
     uint64_t lumSum = 0;
@@ -245,6 +314,7 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
         int gy = std::clamp(y / cellH, 0, gridH - 1);
         const uint8_t* sRow = srcPx + static_cast<size_t>(y) * src.stride;
         uint8_t* dRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
+        uint8_t* nRow = pf.rawNormBmp.pixels.data() + static_cast<size_t>(y) * pf.rawNormBmp.stride;
         uint8_t* mRow = pf.inkMask.data() + static_cast<size_t>(y) * srcW;
 
         for (int x = 0; x < srcW; ++x) {
@@ -265,6 +335,7 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
             int r = sRow[x * 4 + 2];
 
             uint8_t ink = 255;
+            uint8_t gentleInk = 255;
             int maxD = 0;
             if (isDarkTheme) {
                 int dR = std::max(0, r - bgR);
@@ -274,12 +345,14 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
                 int lumD = (dR * 77 + dG * 150 + dB * 29) >> 8;
                 int delta = (maxD * 2 + lumD) / 3;
 
-                if (delta <= 20) {
-                    ink = 255;
-                } else {
-                    float t = std::clamp(static_cast<float>(delta - 20) / 102.0f, 0.0f, 1.0f);
+                if (delta > 19) {
+                    float t = std::clamp(static_cast<float>(delta - 19) / 100.0f, 0.0f, 1.0f);
                     float smooth = t * t * (3.0f - 2.0f * t);
                     ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
+                }
+                if (delta > 12) {
+                    float tg = std::clamp(static_cast<float>(delta - 12) / 145.0f, 0.0f, 1.0f);
+                    gentleInk = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - tg), 0.0f, 255.0f));
                 }
             } else {
                 int dR = std::max(0, bgR - r);
@@ -287,12 +360,14 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
                 int dB = std::max(0, bgB - b);
                 maxD = std::max({ dR, dG, dB });
 
-                if (maxD <= 18) {
-                    ink = 255;
-                } else {
-                    float t = std::clamp(static_cast<float>(maxD - 18) / 105.0f, 0.0f, 1.0f);
+                if (maxD > 17) {
+                    float t = std::clamp(static_cast<float>(maxD - 17) / 104.0f, 0.0f, 1.0f);
                     float smooth = t * t * (3.0f - 2.0f * t);
                     ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
+                }
+                if (maxD > 10) {
+                    float tg = std::clamp(static_cast<float>(maxD - 10) / 145.0f, 0.0f, 1.0f);
+                    gentleInk = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - tg), 0.0f, 255.0f));
                 }
             }
 
@@ -301,13 +376,18 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
             dRow[x * 4 + 2] = ink;
             dRow[x * 4 + 3] = 255;
 
+            nRow[x * 4 + 0] = gentleInk;
+            nRow[x * 4 + 1] = gentleInk;
+            nRow[x * 4 + 2] = gentleInk;
+            nRow[x * 4 + 3] = 255;
+
             if (maxD >= 36 || ink < 190) {
                 mRow[x] = 1;
             }
         }
     }
 
-    // Extract 8-connected components from inkMask
+    // Extract 8-connected components from inkMask with 5-zone vertical curvature profiles
     std::vector<uint8_t> visited(totalPixels, 0);
     struct Pt { int x, y; };
     std::vector<Pt> pts;
@@ -352,23 +432,30 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
             comp.pixelCount = static_cast<int>(pts.size());
             if (comp.pixelCount >= 2) {
                 int h = std::max(1, comp.height());
-                float topSum = 0.0f, midSum = 0.0f, botSum = 0.0f;
-                int topCnt = 0, midCnt = 0, botCnt = 0;
+                float sum[5] = {};
+                int cnt[5] = {};
                 for (const auto& p : pts) {
                     float relY = static_cast<float>(p.y - comp.minY) / static_cast<float>(h);
-                    if (relY <= 0.25f) { topSum += p.x; ++topCnt; }
-                    else if (relY >= 0.38f && relY <= 0.62f) { midSum += p.x; ++midCnt; }
-                    else if (relY >= 0.75f) { botSum += p.x; ++botCnt; }
+                    int zone = 2;
+                    if (relY <= 0.22f) zone = 0;
+                    else if (relY <= 0.40f) zone = 1;
+                    else if (relY <= 0.60f) zone = 2;
+                    else if (relY <= 0.78f) zone = 3;
+                    else zone = 4;
+                    sum[zone] += p.x;
+                    ++cnt[zone];
                 }
-                comp.topMeanX = topCnt > 0 ? (topSum / topCnt) : ((comp.minX + comp.maxX) * 0.5f);
-                comp.midMeanX = midCnt > 0 ? (midSum / midCnt) : ((comp.minX + comp.maxX) * 0.5f);
-                comp.botMeanX = botCnt > 0 ? (botSum / botCnt) : ((comp.minX + comp.maxX) * 0.5f);
+                float cx = comp.centerX();
+                comp.topMeanX = cnt[0] > 0 ? (sum[0] / cnt[0]) : cx;
+                comp.upStemX  = cnt[1] > 0 ? (sum[1] / cnt[1]) : cx;
+                comp.midMeanX = cnt[2] > 0 ? (sum[2] / cnt[2]) : cx;
+                comp.loStemX  = cnt[3] > 0 ? (sum[3] / cnt[3]) : cx;
+                comp.botMeanX = cnt[4] > 0 ? (sum[4] / cnt[4]) : cx;
                 rawComps.push_back(comp);
             }
         }
     }
 
-    // Estimate median glyph height from normal-sized character components
     std::vector<int> heights;
     heights.reserve(rawComps.size());
     int minNormalH = std::max(6, static_cast<int>(7.0f * src.scaleFactor));
@@ -385,7 +472,6 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
         pf.medGlyphH = 15.0f * src.scaleFactor;
     }
 
-    // Filter out vertical editor indentation guide lines and giant UI borders
     pf.comps.reserve(rawComps.size());
     for (const auto& c : rawComps) {
         if (c.height() > static_cast<int>(pf.medGlyphH * 1.85f) && c.width() <= static_cast<int>(4.5f * src.scaleFactor)) {
@@ -466,7 +552,7 @@ void ResampleToTensor(const RawBitmap& src, float rx, float ry, float rw, float 
 }
 
 // ------------------------------------------------------------------------------------------------
-// Step 2: 2D Connected-Component Line & Clause Detector (0.3 ms, 0 duplicates, 0 dropped symbols)
+// Step 2: 2D Connected-Component Line & Clause Detector
 // ------------------------------------------------------------------------------------------------
 
 struct DetBox {
@@ -477,7 +563,6 @@ struct DetBox {
 std::vector<DetBox> BuildComponentLineBoxes(const PreprocessedFrame& pf) {
     float refH = std::max(10.0f, pf.medGlyphH);
 
-    // 1. Separate tall/normal components from small punctuation components ('.', ',', '"', '\'', '_', '-', '=')
     std::vector<const InkComponent*> seedComps;
     std::vector<const InkComponent*> smallComps;
     for (const auto& c : pf.comps) {
@@ -530,7 +615,6 @@ std::vector<DetBox> BuildComponentLineBoxes(const PreprocessedFrame& pf) {
         }
     }
 
-    // Attach small punctuation components ('.', ',', '"', '_', '=', ';') to their vertically containing/nearest row
     for (const auto* sm : smallComps) {
         RowBand* targetRow = nullptr;
         float bestDist = 1e9f;
@@ -555,7 +639,6 @@ std::vector<DetBox> BuildComponentLineBoxes(const PreprocessedFrame& pf) {
         return a.meanCy() < b.meanCy();
     });
 
-    // 2. Within each row, sort components left-to-right and split only at wide column gaps (> 3.2 * refH)
     std::vector<DetBox> boxes;
     float maxIntraLineGap = refH * 3.2f;
 
@@ -603,7 +686,7 @@ std::vector<DetBox> BuildComponentLineBoxes(const PreprocessedFrame& pf) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Step 3: Recognition (SVTR-LCNet + Pushdown Automaton Bracket Stack & Curvature Verifier)
+// Step 3: Recognition (ASCII-Constrained CTC + Adaptive Dual-Model/Dual-View Ensemble + Topology)
 // ------------------------------------------------------------------------------------------------
 
 struct RecChar {
@@ -615,9 +698,9 @@ struct RecChar {
 struct RecResult {
     std::vector<RecChar> chars;
     float meanProb = 0.0f;
+    float minProb = 1.0f;
 };
 
-// Returns -1 if component curves left like '{' or '(', +1 if it curves right like '}' or ')', 0 otherwise
 int GetVerticalBracketCurvature(const InkComponent& c, float refH) {
     if (c.height() < static_cast<int>(refH * 0.55f) || c.width() > static_cast<int>(refH * 0.85f)) {
         return 0;
@@ -629,69 +712,306 @@ int GetVerticalBracketCurvature(const InkComponent& c, float refH) {
     return 0;
 }
 
-std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, const std::vector<DetBox>& boxes) {
-    std::vector<RecResult> results(boxes.size());
-    if (boxes.empty()) return results;
+// Distinguishes curly brace '{'/'}' from smooth parenthesis '('/')' using 5-zone stem vs tip profile:
+// In '{' (curv < 0), the middle point juts left of the upper/lower stems (midMeanX < stemsX), while
+// the top/bottom hooks curve right of the stems (endsX > stemsX).
+bool IsCurlyBraceShape(const InkComponent& c, int curv) {
+    float stemsX = 0.5f * (c.upStemX + c.loStemX);
+    float endsX = 0.5f * (c.topMeanX + c.botMeanX);
+    if (curv < 0) {
+        return (c.midMeanX < stemsX - 0.12f) && (endsX > stemsX + 0.12f);
+    }
+    if (curv > 0) {
+        return (c.midMeanX > stemsX + 0.12f) && (endsX < stemsX - 0.12f);
+    }
+    return false;
+}
+
+// Checks whether a horizontal region around xCenter contains two vertically stacked horizontal bars ('=')
+bool HasTwoHorizontalBarsAt(const DetBox& bx, const PreprocessedFrame& pf, float xCenter) {
+    // 1. Check 8-connected components in bx.comps for two vertically stacked bars at xCenter
+    float tol = std::max(5.0f, pf.medGlyphH * 0.42f);
+    std::vector<const InkComponent*> localComps;
+    for (const auto& c : bx.comps) {
+        if (std::abs(c.centerX() - xCenter) <= tol &&
+            c.height() <= static_cast<int>(pf.medGlyphH * 0.55f) &&
+            c.width() >= static_cast<int>(pf.medGlyphH * 0.18f)) {
+            localComps.push_back(&c);
+        }
+    }
+    for (size_t a = 0; a < localComps.size(); ++a) {
+        for (size_t b = a + 1; b < localComps.size(); ++b) {
+            const auto* c1 = localComps[a];
+            const auto* c2 = localComps[b];
+            int overlapX = std::min(c1->maxX, c2->maxX) - std::max(c1->minX, c2->minX) + 1;
+            int minW = std::min(c1->width(), c2->width());
+            if (overlapX >= std::max(1, minW / 2) && std::abs(c1->centerY() - c2->centerY()) >= 2.0f) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Also check grayscale vertical profile in cleanBmp for two dark horizontal bars separated by a lighter valley
+    int cx = static_cast<int>(std::round(xCenter));
+    int rx0 = std::clamp(cx - static_cast<int>(pf.medGlyphH * 0.28f), 0, pf.cleanBmp.width - 1);
+    int rx1 = std::clamp(cx + static_cast<int>(pf.medGlyphH * 0.28f), rx0 + 1, pf.cleanBmp.width);
+    int ry0 = std::clamp(static_cast<int>(bx.y0), 0, pf.cleanBmp.height - 1);
+    int ry1 = std::clamp(static_cast<int>(bx.y1), ry0 + 1, pf.cleanBmp.height);
+
+    std::vector<int> rowMinInk(ry1 - ry0, 255);
+    int runs = 0;
+    bool inRun = false;
+    for (int y = ry0; y < ry1; ++y) {
+        const uint8_t* cRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
+        int darkCount = 0;
+        int minVal = 255;
+        for (int x = rx0; x < rx1; ++x) {
+            int v = cRow[x * 4];
+            minVal = std::min(minVal, v);
+            if (v < 155) ++darkCount;
+        }
+        rowMinInk[y - ry0] = minVal;
+        if (darkCount >= 2) {
+            if (!inRun) { ++runs; inRun = true; }
+        } else {
+            inRun = false;
+        }
+    }
+    if (runs >= 2) return true;
+
+    // Check for a lighter valley row between two darker bar rows even if anti-aliasing bridged them
+    for (int r = 1; r + 1 < static_cast<int>(rowMinInk.size()); ++r) {
+        int topDark = 255, botDark = 255;
+        for (int t = 0; t < r; ++t) topDark = std::min(topDark, rowMinInk[t]);
+        for (int b = r + 1; b < static_cast<int>(rowMinInk.size()); ++b) botDark = std::min(botDark, rowMinInk[b]);
+        if (topDark < 110 && botDark < 110 && rowMinInk[r] >= std::max(topDark, botDark) + 45) {
+            return true;
+        }
+    }
+    return false;
+}
+
+RecResult DecodeBoxWithRecognizer(Recognizer& rec, const RawBitmap& viewBmp, const DetBox& bx,
+                                  bool constrainAscii, Ort::MemoryInfo& memInfo) {
+    RecResult res;
+    float tightW = bx.x1 - bx.x0;
+    float tightH = bx.y1 - bx.y0;
+
+    float padY = std::max(3.0f, tightH * 0.22f);
+    float padX = std::max(6.0f, tightH * 0.45f);
+    float cropX = bx.x0 - padX;
+    float cropY = bx.y0 - padY;
+    float cropW = tightW + padX * 2.0f;
+    float cropH = tightH + padY * 2.0f;
+
+    int rw = std::clamp(static_cast<int>(std::ceil(kRecHeight * cropW / std::max(1.0f, cropH))), 24, kRecMaxWidth);
+    int batchW = std::max(kRecMinWidth, ((rw + 7) / 8) * 8);
+
+    const size_t plane = static_cast<size_t>(batchW) * kRecHeight;
+    std::vector<float> input(3 * plane, 1.0f);  // +1.0f = pure white background
 
     const float mean[3] = { 0.5f, 0.5f, 0.5f };
     const float stdv[3] = { 0.5f, 0.5f, 0.5f };
-    auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    ResampleToTensor(viewBmp, cropX, cropY, cropW, cropH, rw, kRecHeight, batchW, plane,
+                     input.data(), mean, stdv, false);
 
-    // Pushdown Automaton (PDA) open-delimiter stack ('{' or '(') across lines to disambiguate standalone ')' vs '}'
+    std::array<int64_t, 4> shape{ 1, 3, kRecHeight, batchW };
+    Ort::Value inTensor = Ort::Value::CreateTensor<float>(memInfo, input.data(), input.size(), shape.data(), shape.size());
+    const char* inNames[] = { rec.inName.c_str() };
+    const char* outNames[] = { rec.outName.c_str() };
+    auto outputs = rec.session.Run(Ort::RunOptions{ nullptr }, inNames, &inTensor, 1, outNames, 1);
+
+    auto outShape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+    const int T = static_cast<int>(outShape[1]);
+    const int C = static_cast<int>(outShape[2]);
+    const float* out = outputs[0].GetTensorData<float>();
+    const float stepPx = static_cast<float>(batchW) / static_cast<float>(T);
+    const float toBitmap = cropW / static_cast<float>(rw);
+
+    int prev = 0;
+    double probSum = 0.0;
+    float minP = 1.0f;
+
+    for (int t = 0; t < T; ++t) {
+        const float* row = out + static_cast<size_t>(t) * C;
+        int best = 0;
+        float bestVal = row[0];
+        if (constrainAscii && !rec.allowed.empty()) {
+            for (int idx : rec.allowed) {
+                if (idx < C && row[idx] > bestVal) {
+                    bestVal = row[idx];
+                    best = idx;
+                }
+            }
+        } else {
+            best = static_cast<int>(std::max_element(row, row + C) - row);
+            bestVal = row[best];
+        }
+
+        if (best != 0 && best != prev && best < static_cast<int>(rec.alphabet.size())) {
+            wchar_t ch = constrainAscii ? rec.asciiOf[static_cast<size_t>(best)] :
+                         (rec.alphabet[static_cast<size_t>(best)].empty() ? 0 : rec.alphabet[static_cast<size_t>(best)][0]);
+            if (ch != 0) {
+                float xIn = (static_cast<float>(t) + 0.5f) * stepPx;
+                float bmpX = std::clamp(cropX + xIn * toBitmap, bx.x0, bx.x1);
+                res.chars.push_back({ ch, bmpX, bestVal });
+                probSum += bestVal;
+                if (ch != L' ') minP = std::min(minP, bestVal);
+            }
+        }
+        prev = best;
+    }
+    res.meanProb = res.chars.empty() ? 0.0f : static_cast<float>(probSum / res.chars.size());
+    res.minProb = res.chars.empty() ? 0.0f : minP;
+    return res;
+}
+
+// Word-level confidence fusion between v4 (strong camelCase & leading-dot retention) and v5 (strong digit/symbol head)
+RecResult FuseRecResultsByWord(const RecResult& v4Res, const RecResult& v5Res) {
+    if (v4Res.chars.empty()) return v5Res;
+    if (v5Res.chars.empty()) return v4Res;
+
+    struct WordTok {
+        std::vector<RecChar> chars;
+        float meanProb = 0.0f;
+        float minProb = 1.0f;
+        std::wstring text() const {
+            std::wstring s;
+            for (const auto& c : chars) s += c.ch;
+            return s;
+        }
+    };
+
+    auto splitWords = [](const RecResult& rr) {
+        std::vector<WordTok> out;
+        size_t i = 0;
+        while (i < rr.chars.size()) {
+            while (i < rr.chars.size() && rr.chars[i].ch == L' ') ++i;
+            if (i >= rr.chars.size()) break;
+            WordTok w;
+            double sum = 0.0;
+            while (i < rr.chars.size() && rr.chars[i].ch != L' ') {
+                w.chars.push_back(rr.chars[i]);
+                sum += rr.chars[i].prob;
+                w.minProb = std::min(w.minProb, rr.chars[i].prob);
+                ++i;
+            }
+            w.meanProb = static_cast<float>(sum / w.chars.size());
+            out.push_back(std::move(w));
+        }
+        return out;
+    };
+
+    auto w4 = splitWords(v4Res);
+    auto w5 = splitWords(v5Res);
+    if (w4.size() != w5.size() || w4.empty()) {
+        RecResult out = (v5Res.meanProb > v4Res.meanProb + 0.035f) ? v5Res : v4Res;
+        if (!v4Res.chars.empty() && v4Res.chars.front().ch == L'.' &&
+            !out.chars.empty() && out.chars.front().ch != L'.') {
+            out.chars.insert(out.chars.begin(), v4Res.chars.front());
+        }
+        return out;
+    }
+
+    RecResult fused;
+    double totalProb = 0.0;
+    float minP = 1.0f;
+
+    for (size_t k = 0; k < w4.size(); ++k) {
+        if (k > 0) {
+            float spX = 0.5f * (fused.chars.back().x + w4[k].chars.front().x);
+            fused.chars.push_back({ L' ', spX, 0.99f });
+            totalProb += 0.99;
+        }
+
+        std::wstring s4 = w4[k].text();
+        std::wstring s5 = w5[k].text();
+        const WordTok* chosen = &w4[k];
+
+        if (s4 != s5) {
+            bool sameCaseInsensitive = (s4.size() == s5.size());
+            if (sameCaseInsensitive) {
+                for (size_t c = 0; c < s4.size(); ++c) {
+                    if (std::towlower(s4[c]) != std::towlower(s5[c])) {
+                        sameCaseInsensitive = false;
+                        break;
+                    }
+                }
+            }
+
+            if (sameCaseInsensitive) {
+                // Check if s4 has genuine interior camelCase (e.g. 'useState', 'useLoginStore') that s5 lowercased
+                bool s4HasInteriorCamel = false;
+                for (size_t c = 1; c + 1 < s4.size(); ++c) {
+                    if (std::iswlower(s4[c - 1]) && std::iswupper(s4[c]) && std::iswlower(s4[c + 1])) {
+                        s4HasInteriorCamel = true;
+                        break;
+                    }
+                }
+                if (s4HasInteriorCamel) chosen = &w4[k];
+                else chosen = &w5[k];
+            } else {
+                // Keep leading '.' if v4 detected it and v5 dropped it (e.g. '.populate' vs 'populate')
+                if (s4.size() == s5.size() + 1 && s4.front() == L'.' && s4.substr(1) == s5) {
+                    chosen = &w4[k];
+                } else if (w4[k].minProb > w5[k].minProb + 0.08f && w4[k].meanProb > w5[k].meanProb + 0.04f &&
+                           !(s5.find(L'0') != std::wstring::npos && s4.find(L'e') != std::wstring::npos)) {
+                    chosen = &w4[k];
+                } else {
+                    chosen = &w5[k];
+                }
+            }
+        }
+
+        for (const auto& rc : chosen->chars) {
+            fused.chars.push_back(rc);
+            totalProb += rc.prob;
+            minP = std::min(minP, rc.prob);
+        }
+    }
+
+    fused.meanProb = fused.chars.empty() ? 0.0f : static_cast<float>(totalProb / fused.chars.size());
+    fused.minProb = fused.chars.empty() ? 0.0f : minP;
+    return fused;
+}
+
+std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, const std::vector<DetBox>& boxes) {
+    std::vector<RecResult> results(boxes.size());
+    if (boxes.empty() || e.recs.empty()) return results;
+
+    PaddleOcr::Options opts = PaddleOcr::GetOptions();
+    Recognizer* recV4 = e.Find(L"v4");
+    Recognizer* recV5 = e.Find(L"v5");
+
+    auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
     std::vector<wchar_t> openStack;
 
     for (size_t i = 0; i < boxes.size(); ++i) {
         const DetBox& bx = boxes[i];
         float tightW = bx.x1 - bx.x0;
-        float tightH = bx.y1 - bx.y0;
 
-        float padY = std::max(3.0f, tightH * 0.22f);
-        float padX = std::max(6.0f, tightH * 0.45f);
-        float cropX = bx.x0 - padX;
-        float cropY = bx.y0 - padY;
-        float cropW = tightW + padX * 2.0f;
-        float cropH = tightH + padY * 2.0f;
-
-        int rw = std::clamp(static_cast<int>(std::ceil(kRecHeight * cropW / std::max(1.0f, cropH))), 24, kRecMaxWidth);
-        int batchW = std::max(kRecMinWidth, ((rw + 7) / 8) * 8);
-
-        const size_t plane = static_cast<size_t>(batchW) * kRecHeight;
-        std::vector<float> input(3 * plane, 1.0f);  // +1.0f = pure white background
-
-        ResampleToTensor(pf.cleanBmp, cropX, cropY, cropW, cropH, rw, kRecHeight, batchW, plane,
-                         input.data(), mean, stdv, false);
-
-        std::array<int64_t, 4> shape{ 1, 3, kRecHeight, batchW };
-        Ort::Value inTensor = Ort::Value::CreateTensor<float>(memInfo, input.data(), input.size(), shape.data(), shape.size());
-        const char* inNames[] = { e.recIn.c_str() };
-        const char* outNames[] = { e.recOut.c_str() };
-        auto outputs = e.rec.Run(Ort::RunOptions{ nullptr }, inNames, &inTensor, 1, outNames, 1);
-
-        auto outShape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
-        const int T = static_cast<int>(outShape[1]);
-        const int C = static_cast<int>(outShape[2]);
-        const float* out = outputs[0].GetTensorData<float>();
-        const float stepPx = static_cast<float>(batchW) / static_cast<float>(T);
-        const float toBitmap = cropW / static_cast<float>(rw);
-
-        RecResult& res = results[i];
-        int prev = 0;
-        double probSum = 0.0;
-        for (int t = 0; t < T; ++t) {
-            const float* row = out + static_cast<size_t>(t) * C;
-            int best = static_cast<int>(std::max_element(row, row + C) - row);
-            if (best != 0 && best != prev && best < static_cast<int>(e.alphabet.size())) {
-                const std::wstring& s = e.alphabet[static_cast<size_t>(best)];
-                if (!s.empty()) {
-                    float xIn = (static_cast<float>(t) + 0.5f) * stepPx;
-                    float bmpX = std::clamp(cropX + xIn * toBitmap, bx.x0, bx.x1);
-                    res.chars.push_back({ s[0], bmpX, row[best] });
-                    probSum += row[best];
+        RecResult res;
+        if (opts.model == L"v5" && recV5) {
+            res = DecodeBoxWithRecognizer(*recV5, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+        } else if (opts.model == L"v4" && recV4) {
+            res = DecodeBoxWithRecognizer(*recV4, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+        } else if (recV4 && recV5) {
+            RecResult r4 = DecodeBoxWithRecognizer(*recV4, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+            if (r4.minProb < 0.93f || r4.meanProb < 0.97f) {
+                RecResult r5 = DecodeBoxWithRecognizer(*recV5, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+                res = FuseRecResultsByWord(r4, r5);
+            } else {
+                res = std::move(r4);
+            }
+            if (opts.dualViewVerify && (res.meanProb < 0.88f || res.minProb < 0.58f)) {
+                RecResult rawCand = DecodeBoxWithRecognizer(*recV5, pf.rawNormBmp, bx, opts.constrainToCodeAscii, memInfo);
+                if (rawCand.meanProb > res.meanProb + 0.03f && rawCand.chars.size() >= res.chars.size()) {
+                    res = std::move(rawCand);
                 }
             }
-            prev = best;
+        } else {
+            res = DecodeBoxWithRecognizer(*e.recs.front(), pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
         }
-        res.meanProb = res.chars.empty() ? 0.0f : static_cast<float>(probSum / res.chars.size());
 
         // Case A: Standalone 1-3 component symbol box ('}', '{', '};', ')')
         if (!bx.comps.empty() && bx.comps.size() <= 3 && tightW <= pf.medGlyphH * 1.65f) {
@@ -700,6 +1020,9 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 wchar_t sym = (curv > 0) ? L'}' : L'{';
                 if (curv > 0 && !openStack.empty()) {
                     sym = (openStack.back() == L'(') ? L')' : L'}';
+                } else if (curv > 0 && !IsCurlyBraceShape(bx.comps[0], curv) &&
+                           !res.chars.empty() && res.chars.front().ch == L')') {
+                    sym = L')';
                 }
                 bool hasSemi = false;
                 if (bx.comps.size() >= 2) {
@@ -716,98 +1039,77 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 res.meanProb = 0.95f;
             }
         }
-        // Case B: Multi-token line where SVTR misread leading '}' or trailing '{' / '('
+        // Case B: Multi-token line structural & topological verification (keyword-free!)
         else if (!bx.comps.empty() && !res.chars.empty()) {
-            // Check leading '}' before 'catch' or 'else'
+            // 1. Leading closing brace '}' or member-access dot '.' at the start of a line
             const InkComponent& firstC = bx.comps.front();
-            if (GetVerticalBracketCurvature(firstC, pf.medGlyphH) > 0) {
+            if (GetVerticalBracketCurvature(firstC, pf.medGlyphH) > 0 && IsCurlyBraceShape(firstC, +1)) {
                 if (res.chars.front().ch != L'}') {
-                    // Check if the line contains "catch" or "else"
-                    std::wstring lineStr;
-                    for (const auto& rc : res.chars) lineStr += rc.ch;
-                    if (lineStr.find(L"catch") != std::wstring::npos || lineStr.find(L"else") != std::wstring::npos) {
-                        if (res.chars.front().ch == L'-' || res.chars.front().ch == L'1' || res.chars.front().ch == L')') {
-                            res.chars.front().ch = L'}';
-                        } else {
-                            res.chars.insert(res.chars.begin(), { L'}', 0.5f * (firstC.minX + firstC.maxX), 0.95f });
-                            res.chars.insert(res.chars.begin() + 1, { L' ', static_cast<float>(firstC.maxX + 2), 0.95f });
-                        }
+                    if (res.chars.front().ch == L'-' || res.chars.front().ch == L'1' || res.chars.front().ch == L')') {
+                        res.chars.front().ch = L'}';
+                    } else if (firstC.maxX + 2 < res.chars.front().x) {
+                        res.chars.insert(res.chars.begin(), { L'}', firstC.centerX(), 0.95f });
+                        res.chars.insert(res.chars.begin() + 1, { L' ', static_cast<float>(firstC.maxX + 2), 0.95f });
                     }
                 }
+            } else if (firstC.width() <= static_cast<int>(pf.medGlyphH * 0.48f) &&
+                       firstC.height() <= static_cast<int>(pf.medGlyphH * 0.48f) &&
+                       firstC.minY >= static_cast<int>(bx.y0 + (bx.y1 - bx.y0) * 0.30f) &&
+                       res.chars.front().ch != L'.' && std::iswlower(res.chars.front().ch)) {
+                res.chars.insert(res.chars.begin(), { L'.', firstC.centerX(), 0.95f });
             }
 
-            // Check trailing '{' or '(' at the end of the line (e.g. 'if (...) {', '=> {', 'return (')
+            // 2. Trailing opening bracket '{' or '(' at the end of a line
             const InkComponent& lastC = bx.comps.back();
             if (GetVerticalBracketCurvature(lastC, pf.medGlyphH) < 0) {
-                std::wstring lineStr;
-                for (const auto& rc : res.chars) if (rc.ch != L' ') lineStr += rc.ch;
-                bool isReturnLine = (lineStr.rfind(L"return", 0) == 0 && lineStr.size() <= 8);
-                wchar_t expectedOpen = isReturnLine ? L'(' : L'{';
+                wchar_t prevNonSpace = 0;
+                for (size_t k = 0; k + 1 < res.chars.size(); ++k) {
+                    if (res.chars[k].ch != L' ') prevNonSpace = res.chars[k].ch;
+                }
+                bool afterBlockHeader = (prevNonSpace == L')' || prevNonSpace == L'>');
 
                 wchar_t lastCh = res.chars.back().ch;
-                if (lastCh == L'-' || lastCh == L'0' || lastCh == L'(' || lastCh == L'{' || lastCh == L'1') {
-                    res.chars.back().ch = expectedOpen;
-                } else if (lastCh == L'>' || lastCh == L')' || std::iswalnum(lastCh)) {
+                if (lastCh == L'-' || lastCh == L'0' || lastCh == L'1') {
+                    res.chars.back().ch = afterBlockHeader ? L'{' : L'(';
+                } else if (afterBlockHeader && lastCh == L'(') {
+                    res.chars.back().ch = L'{';
+                } else if (lastCh == L'>' || lastCh == L')') {
                     res.chars.push_back({ L' ', static_cast<float>(lastC.minX - 2), 0.95f });
-                    res.chars.push_back({ expectedOpen, 0.5f * (lastC.minX + lastC.maxX), 0.95f });
+                    res.chars.push_back({ L'{', lastC.centerX(), 0.95f });
+                } else if (std::iswalnum(lastCh) && lastC.minX > res.chars.back().x + pf.medGlyphH * 0.25f) {
+                    res.chars.push_back({ L' ', static_cast<float>(lastC.minX - 2), 0.95f });
+                    res.chars.push_back({ L'(', lastC.centerX(), 0.95f });
                 }
             }
 
-            // Ensure standard space between ')' and trailing '{' in block headers ('if (...) {', 'catch (error) {')
-            if (res.chars.size() >= 2 && res.chars.back().ch == L'{' && res.chars[res.chars.size() - 2].ch == L')') {
+            // Ensure standard space between ')' or '>' and trailing '{' in block headers
+            if (res.chars.size() >= 2 && res.chars.back().ch == L'{' &&
+                (res.chars[res.chars.size() - 2].ch == L')' || res.chars[res.chars.size() - 2].ch == L'>')) {
                 float spX = res.chars.back().x - 2.0f;
                 res.chars.insert(res.chars.end() - 1, { L' ', spX, 0.95f });
             }
 
-            // Disambiguate '-' vs '=' using vertical scanline profile + declaration context
-            bool hasEqualsOnLine = false;
-            for (const auto& rc : res.chars) {
-                if (rc.ch == L'=') { hasEqualsOnLine = true; break; }
+            // Normalize 2-char logical OR (' || ') where '|' + ('l'|'1'|'I') was decoded between spaces
+            auto isPipeLookalike = [](wchar_t c) { return c == L'|' || c == L'l' || c == L'1' || c == L'I'; };
+            for (size_t k = 1; k + 2 < res.chars.size(); ++k) {
+                if (res.chars[k - 1].ch == L' ' && res.chars[k + 2].ch == L' ' &&
+                    isPipeLookalike(res.chars[k].ch) && isPipeLookalike(res.chars[k + 1].ch) &&
+                    !(res.chars[k].ch == L'1' && res.chars[k + 1].ch == L'1')) {
+                    res.chars[k].ch = L'|';
+                    res.chars[k + 1].ch = L'|';
+                }
             }
-            std::wstring fullLineText;
-            for (const auto& rc : res.chars) fullLineText += rc.ch;
-            bool isConstLetVar = (fullLineText.find(L"const ") != std::wstring::npos ||
-                                  fullLineText.find(L"let ") != std::wstring::npos ||
-                                  fullLineText.find(L"var ") != std::wstring::npos);
 
+            // 3. Keyword-free 2-Bar Connected-Component '=' vs '-' Verification
             for (size_t k = 0; k < res.chars.size(); ++k) {
                 if (res.chars[k].ch == L'-') {
-                    bool isStandaloneDash = (k > 0 && k + 1 < res.chars.size() &&
-                                             res.chars[k - 1].ch == L' ' && res.chars[k + 1].ch == L' ');
-                    if (isStandaloneDash && isConstLetVar && !hasEqualsOnLine) {
+                    if (HasTwoHorizontalBarsAt(bx, pf, res.chars[k].x)) {
                         res.chars[k].ch = L'=';
-                        hasEqualsOnLine = true;
-                        continue;
-                    }
-
-                    int cx = static_cast<int>(std::round(res.chars[k].x));
-                    int rx0 = std::clamp(cx - static_cast<int>(pf.medGlyphH * 0.30f), 0, pf.cleanBmp.width - 1);
-                    int rx1 = std::clamp(cx + static_cast<int>(pf.medGlyphH * 0.30f), rx0 + 1, pf.cleanBmp.width);
-                    int ry0 = std::clamp(static_cast<int>(bx.y0), 0, pf.cleanBmp.height - 1);
-                    int ry1 = std::clamp(static_cast<int>(bx.y1), ry0 + 1, pf.cleanBmp.height);
-
-                    int runs = 0;
-                    bool inRun = false;
-                    for (int y = ry0; y < ry1; ++y) {
-                        const uint8_t* cRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
-                        int darkPixels = 0;
-                        for (int x = rx0; x < rx1; ++x) {
-                            if (cRow[x * 4] < 145) ++darkPixels;
-                        }
-                        if (darkPixels >= 2) {
-                            if (!inRun) { ++runs; inRun = true; }
-                        } else {
-                            inRun = false;
-                        }
-                    }
-                    if (runs >= 2) {
-                        res.chars[k].ch = L'=';
-                        hasEqualsOnLine = true;
                     }
                 }
             }
 
-            // Recover CTC-collapsed empty string literals '""' when '",' or '"]' or '")' appears outside a string
+            // 4. Recover CTC-collapsed empty string literals '""' when '",' or '"]' or '")' appears outside a string
             int qRun = 0;
             for (size_t k = 0; k < res.chars.size(); ++k) {
                 if (res.chars[k].ch == L'"') {
@@ -825,7 +1127,7 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 }
             }
 
-            // Fix '[a-z]l"' or '[a-z]1"' -> '[a-z]("' (opening paren before string literal misread as 'l'/'1')
+            // 5. Fix '[a-z]l"' or '[a-z]1"' -> '[a-z]("' (opening paren before string literal misread as 'l'/'1')
             bool hasOpenParen = false;
             for (size_t k = 0; k < res.chars.size(); ++k) {
                 if (res.chars[k].ch == L'(') hasOpenParen = true;
@@ -837,7 +1139,7 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 }
             }
 
-            // Strip spurious space immediately after an opening '"' inside a string argument (e.g. '" sender",' -> '"sender",')
+            // 6. Strip spurious space immediately after an opening '"' inside a string argument (e.g. '" sender",' -> '"sender",')
             int qParity = 0;
             for (size_t k = 0; k < res.chars.size(); ++k) {
                 if (res.chars[k].ch == L'"') {
@@ -849,7 +1151,7 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 }
             }
 
-            // Balance leading '(' on single-expression crops ending with ')' (e.g. '(message?._id)')
+            // 7. Balance leading '(' on single-expression crops ending with ')' (e.g. '(message?._id)')
             int pBal = 0;
             for (const auto& rc : res.chars) {
                 if (rc.ch == L'(') ++pBal;
@@ -857,6 +1159,35 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
             }
             if (pBal == -1 && !res.chars.empty() && res.chars.front().ch != L'(' && res.chars.back().ch == L')') {
                 res.chars.insert(res.chars.begin(), { L'(', bx.x0, 0.95f });
+            }
+
+            // 8. Repair single-letter OCR case flips on all-caps acronyms (e.g. "HTTp", "HttP", "posT")
+            size_t aStart = 0;
+            while (aStart < res.chars.size()) {
+                while (aStart < res.chars.size() && !std::iswalpha(res.chars[aStart].ch)) ++aStart;
+                if (aStart >= res.chars.size()) break;
+                size_t aEnd = aStart;
+                int nUp = 0, nLo = 0;
+                while (aEnd < res.chars.size() && std::iswalpha(res.chars[aEnd].ch)) {
+                    if (std::iswupper(res.chars[aEnd].ch)) ++nUp;
+                    else ++nLo;
+                    ++aEnd;
+                }
+                size_t len = aEnd - aStart;
+                if (len >= 3 && nUp >= 1 && nLo >= 1) {
+                    // Case 1: All-caps acronym where 1-2 interior/trailing letters flipped to lowercase ("HTTp", "HttP")
+                    if ((nUp == static_cast<int>(len) - 1 && std::iswupper(res.chars[aStart].ch) && std::iswlower(res.chars[aEnd - 1].ch)) ||
+                        (std::iswupper(res.chars[aStart].ch) && std::iswupper(res.chars[aEnd - 1].ch))) {
+                        for (size_t k = aStart; k < aEnd; ++k) res.chars[k].ch = static_cast<wchar_t>(std::towupper(res.chars[k].ch));
+                    }
+                    // Case 2: Word inside quotes where only the very last letter flipped to uppercase ("posT" -> "POST")
+                    else if (nUp == 1 && std::iswupper(res.chars[aEnd - 1].ch) &&
+                             aStart > 0 && res.chars[aStart - 1].ch == L'"' &&
+                             aEnd < res.chars.size() && res.chars[aEnd].ch == L'"') {
+                        for (size_t k = aStart; k < aEnd; ++k) res.chars[k].ch = static_cast<wchar_t>(std::towupper(res.chars[k].ch));
+                    }
+                }
+                aStart = aEnd;
             }
         }
 
@@ -874,6 +1205,8 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 }
             }
         }
+
+        results[i] = std::move(res);
     }
     return results;
 }
@@ -932,6 +1265,16 @@ Segment BuildSegment(const DetBox& bx, const RecResult& rr) {
 
 } // namespace
 
+void PaddleOcr::SetOptions(const Options& opts) {
+    std::lock_guard<std::mutex> lock(g_optMutex);
+    g_options = opts;
+}
+
+PaddleOcr::Options PaddleOcr::GetOptions() {
+    std::lock_guard<std::mutex> lock(g_optMutex);
+    return g_options;
+}
+
 bool PaddleOcr::EnsureInitialized(std::wstring* outError) {
     std::call_once(g_initOnce, DoInitialize);
     if (!g_ready && outError) *outError = g_initError;
@@ -940,6 +1283,12 @@ bool PaddleOcr::EnsureInitialized(std::wstring* outError) {
 
 bool PaddleOcr::IsAvailable() {
     return g_ready;
+}
+
+std::wstring PaddleOcr::GetActiveEngineDescription() {
+    if (!EnsureInitialized(nullptr) || !g_engine) return L"Unavailable";
+    if (g_engine->recs.size() >= 2) return L"PP-OCRv5 + v4 Dual-View Code Engine";
+    return L"PP-OCR " + g_engine->recs.front()->name + L" Code Engine";
 }
 
 void PaddleOcr::WarmUpAsync() {

@@ -220,7 +220,7 @@ bool HasHorizontalOverlapWithExistingWords(const OcrLineBox& line, const RectF& 
 
 std::wstring OcrService::GetActiveLanguageName() {
     if (PaddleOcr::EnsureInitialized()) {
-        return L"PP-OCRv4 Code Engine";
+        return PaddleOcr::GetActiveEngineDescription();
     }
 
     static std::wstring s_cachedLang;

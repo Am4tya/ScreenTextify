@@ -213,8 +213,9 @@ std::wstring TextFormatter::FormatDocument(
 
                     // If bounding boxes are visually touching (less than 45% of a character width),
                     // they belong to the same programming token (e.g. "findOne(message?" + "._id)"),
-                    // except ') {' which is always space-separated in block headers.
-                    if (gapPx < medianCharWidth * 0.45f && !(lastCh == L')' && firstCh == L'{')) {
+                    // except ') {' or '> {' which are always space-separated in block headers.
+                    if (gapPx < medianCharWidth * 0.45f &&
+                        !((lastCh == L')' || lastCh == L'>') && firstCh == L'{')) {
                         shouldGlue = true;
                     }
                     // Member access / method chaining / optional chaining / parens where OCR split tokens
