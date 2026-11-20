@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Types.h"
+#include "ScreenCapture.h"
 #include <windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -32,6 +33,8 @@ private:
     void OnPaint();
     void BuildUiLayout(float width, float height);
     void RunBuiltInDemoCapture();
+    void RunOcrOnBitmap(const RawBitmap& bmp, const std::wstring& sourceLabel);
+    void RunOcrFromClipboard();
     void SaveSelectedCaptureToFile();
 
     struct UiHotspot {

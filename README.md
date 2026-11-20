@@ -8,10 +8,14 @@
 
 - **Modern Hardware-Accelerated Direct2D Dark-Mode Studio GUI**:
   - Windows 11 Immersive Dark Titlebar & rounded corners (`dwmapi`) with custom Direct2D cards, animated pill switches, live OCR latency metrics, and a scrollable line-numbered **Code & Text Inspector** pane.
-- **3 Capture Modes**:
+- **4 Capture Modes + Image File / Clipboard OCR**:
   1. **Interactive Region Selectext (`Alt + Shift + S`)**: Freeze any video/image region and click or drag over highlighted word/line boxes to copy on mouse release.
   2. **Instant Full-Screen Selectext (`Alt + Shift + D`)**: Immediately freezes and detects all selectable text across the active monitor.
   3. **Quick Snip & Instant Copy (`Alt + Shift + C`)**: Drag a rectangle over any text/code to immediately OCR and copy all of it in a single step.
+  4. **Multi-Frame Stitch & Append (`Alt + Shift + A` or `A` in Overlay)**: Scroll through long code files in YouTube videos, capture each screen, and automatically merge & deduplicate overlapping lines onto your clipboard.
+  5. **Drag-and-Drop & Clipboard Paste OCR (`Ctrl + V`)**: Drop any PNG/JPG/BMP onto the Studio window or press `Ctrl + V` to OCR a screenshot directly from your clipboard.
+- **Persistent Settings, History & Start with Windows**:
+  - Automatically saves your toggle preferences and capture history (up to 30 snippets) to `%APPDATA%\ScreenTextify\`, with a one-click **Start with Windows (System Tray)** switch.
 - **PP-OCRv5 + v4 Dual-View Code Engine (`PaddleOcr` on ONNX Runtime + `Windows.Media.Ocr` Fallback)**:
   - **Horizontal-Strip 25th-Percentile Background Estimator**: Eliminates editor selection highlights (e.g., VS Code `#264F78` blue selection boxes), diff lines, and dimmed video overlays with zero vertical bleed across line boundaries.
   - **2D 8-Connected Component Line & Clause Detector (~0.3 ms)**: Finds exact pixel-tight bounding boxes of every code line and standalone symbol (`{`, `}`, `};`, `(`, `)`), avoiding the ~500 ms overhead and symbol-dropping of scene-photo text detectors.
@@ -29,7 +33,10 @@
 | **`Alt + Shift + S`** | **Interactive Region Selectext**: Crop video/image → click or drag highlighted words |
 | **`Alt + Shift + D`** | **Instant Full-Screen Selectext**: Scan active monitor immediately |
 | **`Alt + Shift + C`** | **Quick Snip & Instant Copy**: Drag rectangle → auto-copy all text inside & close |
+| **`Alt + Shift + A`** | **Stitch & Append Mode**: Drag over scrolled video code → append & deduplicate onto clipboard |
 | **`Alt + Shift + H`** | **Open Studio Dashboard**: View history, toggle settings, or save snippets to file |
+| **`Ctrl + V` (in Studio)** | **Paste Image OCR**: OCR a screenshot or copied image file directly from the clipboard |
+| **`A` / `Ctrl+Shift+C` (in Overlay)** | **Stitch & Append** current selection onto existing clipboard text |
 | **`C` (in Overlay)** | Toggle **Code Indentation Mode** (`ON` / `OFF`) |
 | **`L` (in Overlay)** | Switch between **Word Selection** and **Full-Line Selection** |
 | **`Ctrl + A` (in Overlay)** | Select and copy **All** detected text in the region |

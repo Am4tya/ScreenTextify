@@ -14,6 +14,7 @@ set(MODELS_DIR ${CMAKE_SOURCE_DIR}/third_party/models)
 
 add_executable(ScreenTextify WIN32
     src/main.cpp
+    src/AppStorage.cpp
     src/ScreenCapture.cpp
     src/OcrService.cpp
     src/PaddleOcr.cpp
@@ -29,6 +30,7 @@ target_include_directories(ScreenTextify SYSTEM PRIVATE ${ORT_DIR}/include)
 target_link_libraries(ScreenTextify PRIVATE
     user32
     gdi32
+    advapi32
     shell32
     comdlg32
     ole32

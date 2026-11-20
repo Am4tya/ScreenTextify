@@ -42,6 +42,7 @@ public:
     HWND GetHwnd() const { return m_hwnd; }
 
     static bool CopyTextToClipboard(HWND hwndOwner, const std::wstring& text);
+    static std::wstring ReadTextFromClipboard(HWND hwndOwner);
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -55,7 +56,7 @@ private:
     void ScanActiveMonitorFull();
     void UpdateHudLayout();
     void UpdateSelectionFromDrag(const RectF& dragRect, bool additive);
-    void CopyCurrentSelection(bool copyAllIfNoneSelected = false);
+    void CopyCurrentSelection(bool copyAllIfNoneSelected = false, bool stitchAppend = false);
     void ShowToast(const std::wstring& message, const std::wstring& preview);
 
     HINSTANCE m_hInstance = nullptr;

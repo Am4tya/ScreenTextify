@@ -1,6 +1,7 @@
 #include "ScreenCapture.h"
 #include <objidl.h>
 #include <gdiplus.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <cmath>
 
@@ -367,6 +368,71 @@ RawBitmap ScreenCapture::LoadBitmapFromFile(const std::wstring& filePath) {
     }
 
     Gdiplus::GdiplusShutdown(gdiplusToken);
+    return result;
+}
+
+RawBitmap ScreenCapture::LoadBitmapFromClipboard(HWND hwndOwner) {
+    RawBitmap result;
+    if (!OpenClipboard(hwndOwner)) {
+        return result;
+    }
+
+    // 1. Check if the clipboard holds a bitmap (Win+Shift+S, Copy Image from browser, PrintScreen, etc.)
+    if (IsClipboardFormatAvailable(CF_BITMAP)) {
+        HBITMAP hBmp = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+        if (hBmp) {
+            BITMAP bm = {};
+            if (GetObjectW(hBmp, sizeof(bm), &bm) > 0 && bm.bmWidth > 0 && bm.bmHeight > 0) {
+                int w = bm.bmWidth;
+                int h = bm.bmHeight;
+
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = w;
+                bmi.bmiHeader.biHeight = -h; // Top-down DIB
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+
+                result.width = w;
+                result.height = h;
+                result.stride = w * 4;
+                result.scaleFactor = 1.0f;
+                result.pixels.resize(static_cast<size_t>(w) * h * 4);
+
+                HDC hScreenDC = GetDC(nullptr);
+                if (hScreenDC) {
+                    int rows = GetDIBits(hScreenDC, hBmp, 0, static_cast<UINT>(h), result.pixels.data(), &bmi, DIB_RGB_COLORS);
+                    ReleaseDC(nullptr, hScreenDC);
+                    if (rows > 0) {
+                        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                            result.pixels[i * 4 + 3] = 255;
+                        }
+                    } else {
+                        result = RawBitmap{};
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Check if the user copied an image file in File Explorer (CF_HDROP)
+    std::wstring droppedFile;
+    if (!result.valid() && IsClipboardFormatAvailable(CF_HDROP)) {
+        HDROP hDrop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+        if (hDrop && DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0) > 0) {
+            wchar_t pathBuf[MAX_PATH * 2] = {};
+            if (DragQueryFileW(hDrop, 0, pathBuf, static_cast<UINT>(std::size(pathBuf))) > 0) {
+                droppedFile = pathBuf;
+            }
+        }
+    }
+
+    CloseClipboard();
+
+    if (!result.valid() && !droppedFile.empty()) {
+        result = LoadBitmapFromFile(droppedFile);
+    }
     return result;
 }
 

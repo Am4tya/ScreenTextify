@@ -1,4 +1,5 @@
 #include "Types.h"
+#include "AppStorage.h"
 #include "ScreenCapture.h"
 #include "OcrService.h"
 #include "PaddleOcr.h"
@@ -29,16 +30,19 @@ enum HotkeyId {
     HK_REGION_CAPTURE     = 1001,
     HK_FULLSCREEN_CAPTURE = 1002,
     HK_QUICKSNIP_CAPTURE  = 1003,
-    HK_SHOW_HISTORY       = 1004
+    HK_STITCH_CAPTURE     = 1004,
+    HK_SHOW_HISTORY       = 1005
 };
 
 enum TrayMenuId {
     MENU_CAPTURE_REGION    = 3001,
     MENU_CAPTURE_FULL      = 3002,
     MENU_CAPTURE_QUICKSNIP = 3003,
-    MENU_OPEN_DASHBOARD    = 3004,
-    MENU_TOGGLE_CODE       = 3005,
-    MENU_EXIT              = 3006
+    MENU_CAPTURE_STITCH    = 3004,
+    MENU_OPEN_DASHBOARD    = 3005,
+    MENU_TOGGLE_CODE       = 3006,
+    MENU_TOGGLE_STARTWIN   = 3007,
+    MENU_EXIT              = 3008
 };
 
 HICON CreateSelectextTrayIcon() {
@@ -109,6 +113,7 @@ public:
             UnregisterHotKey(m_hwndTray, HK_REGION_CAPTURE);
             UnregisterHotKey(m_hwndTray, HK_FULLSCREEN_CAPTURE);
             UnregisterHotKey(m_hwndTray, HK_QUICKSNIP_CAPTURE);
+            UnregisterHotKey(m_hwndTray, HK_STITCH_CAPTURE);
             UnregisterHotKey(m_hwndTray, HK_SHOW_HISTORY);
             DestroyWindow(m_hwndTray);
             m_hwndTray = nullptr;
@@ -119,7 +124,10 @@ public:
         }
     }
 
-    bool Initialize(bool showDashboardOnStart, bool showTrayBalloon = true, std::wstring* outInitError = nullptr) {
+    bool Initialize(bool showDashboardOnStart, bool showTrayBalloon = true, std::wstring* outInitError = nullptr, bool loadPersistedSettings = true) {
+        if (loadPersistedSettings) {
+            AppStorage::LoadSettings(m_settings);
+        }
         m_trayIcon = CreateSelectextTrayIcon();
 
         WNDCLASSEXW wc = {};
@@ -208,6 +216,7 @@ private:
         RegisterHotKey(m_hwndTray, HK_REGION_CAPTURE, m_settings.hotkeyRegionModifiers | MOD_NOREPEAT, m_settings.hotkeyRegionVk);
         RegisterHotKey(m_hwndTray, HK_FULLSCREEN_CAPTURE, m_settings.hotkeyFullScreenModifiers | MOD_NOREPEAT, m_settings.hotkeyFullScreenVk);
         RegisterHotKey(m_hwndTray, HK_QUICKSNIP_CAPTURE, m_settings.hotkeyQuickSnipModifiers | MOD_NOREPEAT, m_settings.hotkeyQuickSnipVk);
+        RegisterHotKey(m_hwndTray, HK_STITCH_CAPTURE, m_settings.hotkeyStitchModifiers | MOD_NOREPEAT, m_settings.hotkeyStitchVk);
         RegisterHotKey(m_hwndTray, HK_SHOW_HISTORY, m_settings.hotkeyHistoryModifiers | MOD_NOREPEAT, m_settings.hotkeyHistoryVk);
     }
 
@@ -216,9 +225,12 @@ private:
         AppendMenuW(hMenu, MF_STRING, MENU_CAPTURE_REGION, L"Interactive Region Selectext\tAlt+Shift+S");
         AppendMenuW(hMenu, MF_STRING, MENU_CAPTURE_FULL, L"Instant Full-Screen Selectext\tAlt+Shift+D");
         AppendMenuW(hMenu, MF_STRING, MENU_CAPTURE_QUICKSNIP, L"Quick Snip & Instant Copy\tAlt+Shift+C");
+        AppendMenuW(hMenu, MF_STRING, MENU_CAPTURE_STITCH, L"Stitch & Append Scrolled Code\tAlt+Shift+A");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING | (m_settings.codeIndentationMode ? MF_CHECKED : MF_UNCHECKED),
                     MENU_TOGGLE_CODE, L"Preserve Code Indentation (Code Mode)");
+        AppendMenuW(hMenu, MF_STRING | (m_settings.startWithWindows ? MF_CHECKED : MF_UNCHECKED),
+                    MENU_TOGGLE_STARTWIN, L"Start with Windows (System Tray)");
         AppendMenuW(hMenu, MF_STRING, MENU_OPEN_DASHBOARD, L"Open Studio Dashboard\tAlt+Shift+H");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(hMenu, MF_STRING, MENU_EXIT, L"Exit ScreenTextify");
@@ -261,6 +273,10 @@ private:
                 m_overlay->StartCaptureSession(CaptureLaunchMode::QuickSnipCopy);
                 return 0;
             }
+            if (wParam == HK_STITCH_CAPTURE) {
+                m_overlay->StartCaptureSession(CaptureLaunchMode::StitchAppend);
+                return 0;
+            }
             if (wParam == HK_SHOW_HISTORY) {
                 m_historyWnd->ShowAndFocus();
                 return 0;
@@ -291,13 +307,26 @@ private:
             case MENU_CAPTURE_QUICKSNIP:
                 m_overlay->StartCaptureSession(CaptureLaunchMode::QuickSnipCopy);
                 return 0;
+            case MENU_CAPTURE_STITCH:
+                m_overlay->StartCaptureSession(CaptureLaunchMode::StitchAppend);
+                return 0;
             case MENU_OPEN_DASHBOARD:
                 m_historyWnd->ShowAndFocus();
                 return 0;
             case MENU_TOGGLE_CODE:
                 m_settings.codeIndentationMode = !m_settings.codeIndentationMode;
+                AppStorage::SaveSettings(m_settings);
                 m_historyWnd->RefreshControls();
                 return 0;
+            case MENU_TOGGLE_STARTWIN: {
+                bool target = !m_settings.startWithWindows;
+                if (AppStorage::SetStartWithWindows(target)) {
+                    m_settings.startWithWindows = target;
+                    AppStorage::SaveSettings(m_settings);
+                    m_historyWnd->RefreshControls();
+                }
+                return 0;
+            }
             case MENU_EXIT:
                 PostQuitMessage(0);
                 return 0;
@@ -625,7 +654,7 @@ int RunSelfTest(HINSTANCE hInstance) {
     std::wstring initErr;
     {
         AppController testApp(hInstance);
-        if (!testApp.Initialize(true, false, &initErr)) {
+        if (!testApp.Initialize(true, false, &initErr, false)) {
             report << L"FAILED GUI Initialization: " << initErr << L"\r\n";
             std::wcerr << report.str();
             CoUninitialize();
@@ -706,6 +735,31 @@ int RunSelfTest(HINSTANCE hInstance) {
         OcrDocument importsDoc = OcrService::RecognizeBitmap(importsCrop, &err);
         report << L"10. User Screenshot #3 Dimmed Imports (" << importsDoc.recognitionTimeMs << L" ms):\r\n"
                << TextFormatter::FormatDocument(importsDoc, false, true, nullptr) << L"\r\n";
+    }
+
+    // 11. Verify Multi-Frame Stitch & Append fuzzy overlap deduplication
+    {
+        std::wstring frame1 =
+            L"async function loadUser(id) {\r\n"
+            L"  const res = await fetch('/api/users/' + id);\r\n"
+            L"  if (!res.ok) throw new Error('Failed');\r\n"
+            L"  const data = await res.json();";
+        std::wstring frame2 =
+            L"  if (!res.ok) throw new Error('Failed')\r\n" // slight 1-char diff (dropped ';') to test fuzzy overlap!
+            L"  const data = await res.json();\r\n"
+            L"  return data.user;\r\n"
+            L"}";
+        int overlap = 0, appended = 0;
+        std::wstring stitched = TextFormatter::StitchCodeBlocks(frame1, frame2, &overlap, &appended);
+        if (overlap != 2 || appended != 2) {
+            report << L"FAILED StitchCodeBlocks: expected overlap=2, appended=2, got overlap="
+                   << overlap << L", appended=" << appended << L"\r\n";
+            WriteStdout(report.str());
+            CoUninitialize();
+            return 1;
+        }
+        report << L"11. Multi-Frame Stitch & Append Deduplication: OK (merged " << overlap
+               << L" overlapping lines, appended " << appended << L" new lines)\r\n";
     }
 
     report << L"=== ALL GUI & OCR SELF-TESTS PASSED ===\r\n";

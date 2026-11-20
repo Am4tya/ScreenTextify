@@ -85,7 +85,8 @@ struct CaptureHistoryItem {
 enum class CaptureLaunchMode {
     RegionInteractive,  // Alt+Shift+S: Crop region -> interactive word/line selection
     FullScreenSelect,   // Alt+Shift+D: Instant full-screen interactive word/line selection
-    QuickSnipCopy       // Alt+Shift+C: Crop region -> immediately copy all text & close
+    QuickSnipCopy,      // Alt+Shift+C: Crop region -> immediately copy all text & close
+    StitchAppend        // Alt+Shift+A: Crop scrolled code -> stitch & deduplicate onto clipboard
 };
 
 struct AppSettings {
@@ -95,6 +96,7 @@ struct AppSettings {
     bool autoCloseAfterCopy = false;    // Close overlay immediately after copying in interactive mode
     bool upscaleForOcr = true;          // 2x super-resolution upscale + dark-mode boost for video text
     bool showLivePreviewCard = true;    // Show live formatted code/text card in overlay
+    bool startWithWindows = false;      // Launch silently in System Tray on Windows login
 
     UINT hotkeyRegionModifiers = MOD_ALT | MOD_SHIFT;
     UINT hotkeyRegionVk = 'S';          // Alt+Shift+S: Region -> Selectext Overlay
@@ -104,6 +106,9 @@ struct AppSettings {
 
     UINT hotkeyQuickSnipModifiers = MOD_ALT | MOD_SHIFT;
     UINT hotkeyQuickSnipVk = 'C';       // Alt+Shift+C: Quick Snip & Instant Copy
+
+    UINT hotkeyStitchModifiers = MOD_ALT | MOD_SHIFT;
+    UINT hotkeyStitchVk = 'A';          // Alt+Shift+A: Stitch & Append scrolled code
 
     UINT hotkeyHistoryModifiers = MOD_ALT | MOD_SHIFT;
     UINT hotkeyHistoryVk = 'H';         // Alt+Shift+H: Open Studio Dashboard

@@ -1,4 +1,5 @@
 #include "OverlayWindow.h"
+#include "AppStorage.h"
 #include "OcrService.h"
 #include "TextFormatter.h"
 
@@ -16,11 +17,12 @@ constexpr UINT_PTR TIMER_TOAST_ID = 1001;
 constexpr UINT_PTR TIMER_AUTOCLOSE_ID = 1002;
 
 enum HudButtonId {
-    BTN_CODE_MODE = 1,
-    BTN_LINE_MODE = 2,
-    BTN_COPY_ALL  = 3,
-    BTN_NEW_CROP  = 4,
-    BTN_CLOSE     = 5
+    BTN_CODE_MODE     = 1,
+    BTN_LINE_MODE     = 2,
+    BTN_COPY_ALL      = 3,
+    BTN_STITCH_APPEND = 4,
+    BTN_NEW_CROP      = 5,
+    BTN_CLOSE         = 6
 };
 } // namespace
 
@@ -200,10 +202,11 @@ void OverlayWindow::RunOcrOnRegion(const RectF& localRegion) {
     m_phase = OverlayPhase::InteractiveText;
     UpdateHudLayout();
 
-    // If launched via QuickSnipCopy (Alt+Shift+C), immediately select & copy all detected text!
-    if (m_launchMode == CaptureLaunchMode::QuickSnipCopy && !m_ocrDoc.empty()) {
-        CopyCurrentSelection(true);
-        SetTimer(m_hwnd, TIMER_AUTOCLOSE_ID, 520, nullptr);
+    // If launched via QuickSnipCopy (Alt+Shift+C) or StitchAppend (Alt+Shift+A), act immediately!
+    if ((m_launchMode == CaptureLaunchMode::QuickSnipCopy || m_launchMode == CaptureLaunchMode::StitchAppend) && !m_ocrDoc.empty()) {
+        bool stitch = (m_launchMode == CaptureLaunchMode::StitchAppend);
+        CopyCurrentSelection(true, stitch);
+        SetTimer(m_hwnd, TIMER_AUTOCLOSE_ID, stitch ? 700 : 520, nullptr);
     }
 
     InvalidateRect(m_hwnd, nullptr, FALSE);
@@ -212,7 +215,7 @@ void OverlayWindow::RunOcrOnRegion(const RectF& localRegion) {
 void OverlayWindow::UpdateHudLayout() {
     m_hudButtons.clear();
 
-    float barWidth = 780.0f;
+    float barWidth = 832.0f;
     float barHeight = 44.0f;
 
     float barX = m_activeScanRegion.centerX() - barWidth * 0.5f;
@@ -239,11 +242,12 @@ void OverlayWindow::UpdateHudLayout() {
     };
 
     std::vector<BtnSpec> specs = {
-        { BTN_CODE_MODE, codeOn ? L"Code Indent: ON (C)" : L"Code Indent: OFF (C)", 152.0f, codeOn },
-        { BTN_LINE_MODE, lineOn ? L"Mode: Lines (L)" : L"Mode: Words (L)", 128.0f, lineOn },
-        { BTN_COPY_ALL,  L"Copy All (Ctrl+A)", 130.0f, false },
-        { BTN_NEW_CROP,  L"Re-Crop (R)", 102.0f, false },
-        { BTN_CLOSE,     L"Close (Esc)", 92.0f, false }
+        { BTN_CODE_MODE,     codeOn ? L"Code: ON (C)" : L"Code: OFF (C)", 120.0f, codeOn },
+        { BTN_LINE_MODE,     lineOn ? L"Lines (L)" : L"Words (L)", 98.0f, lineOn },
+        { BTN_COPY_ALL,      L"Copy All (Ctrl+A)", 130.0f, false },
+        { BTN_STITCH_APPEND, L"+ Stitch (A)", 108.0f, m_launchMode == CaptureLaunchMode::StitchAppend },
+        { BTN_NEW_CROP,      L"Re-Crop (R)", 98.0f, false },
+        { BTN_CLOSE,         L"Close (Esc)", 90.0f, false }
     };
 
     float curX = barX + 146.0f; // Leave 136px on the left for the live OCR metrics pill
@@ -277,7 +281,7 @@ void OverlayWindow::UpdateSelectionFromDrag(const RectF& dragRect, bool additive
     }
 }
 
-void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected) {
+void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected, bool stitchAppend) {
     if (m_ocrDoc.empty()) return;
 
     bool anySelected = false;
@@ -308,20 +312,61 @@ void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected) {
     std::wstring formatted = TextFormatter::FormatDocument(m_ocrDoc, true, codeMode, &wordCount);
     if (formatted.empty()) return;
 
-    if (CopyTextToClipboard(m_hwnd, formatted)) {
+    std::wstring finalOutput = formatted;
+    std::wstring title;
+
+    if (stitchAppend) {
+        std::wstring existing = ReadTextFromClipboard(m_hwnd);
+        int overlapLines = 0;
+        int appendedLines = 0;
+        finalOutput = TextFormatter::StitchCodeBlocks(existing, formatted, &overlapLines, &appendedLines);
+
+        // Count total whitespace-delimited tokens in the stitched result
+        std::wstringstream ws(finalOutput);
+        std::wstring tok;
+        size_t totalWords = 0;
+        while (ws >> tok) ++totalWords;
+        wordCount = totalWords;
+
+        title = L"\x2713 Stitched +" + std::to_wstring(appendedLines) + L" lines";
+        if (overlapLines > 0) {
+            title += L" (" + std::to_wstring(overlapLines) + L" overlap merged)";
+        }
+        title += L" \x2022 Clipboard Updated";
+    } else {
+        title = L"\x2713 Copied " + std::to_wstring(wordCount) +
+                (wordCount == 1 ? L" word to Clipboard " : L" words to Clipboard ") +
+                (codeMode ? L"\x2022 Code Indentation ON" : L"\x2022 Standard Text");
+    }
+
+    if (CopyTextToClipboard(m_hwnd, finalOutput)) {
         if (m_onCopied) {
-            m_onCopied(formatted, codeMode, wordCount, m_ocrDoc.recognitionTimeMs);
+            m_onCopied(finalOutput, codeMode, wordCount, m_ocrDoc.recognitionTimeMs);
         }
 
-        std::wstring title = L"\x2713 Copied " + std::to_wstring(wordCount) +
-                             (wordCount == 1 ? L" word to Clipboard " : L" words to Clipboard ") +
-                             (codeMode ? L"\x2022 Code Indentation ON" : L"\x2022 Standard Text");
-        ShowToast(title, formatted);
+        ShowToast(title, stitchAppend ? formatted : finalOutput);
 
-        if (m_settings && m_settings->autoCloseAfterCopy) {
+        if (m_settings && m_settings->autoCloseAfterCopy && !stitchAppend) {
             SetTimer(m_hwnd, TIMER_AUTOCLOSE_ID, 480, nullptr);
         }
     }
+}
+
+std::wstring OverlayWindow::ReadTextFromClipboard(HWND hwndOwner) {
+    std::wstring text;
+    if (!OpenClipboard(hwndOwner)) return text;
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        HGLOBAL hMem = GetClipboardData(CF_UNICODETEXT);
+        if (hMem) {
+            const wchar_t* pText = static_cast<const wchar_t*>(GlobalLock(hMem));
+            if (pText) {
+                text = pText;
+                GlobalUnlock(hMem);
+            }
+        }
+    }
+    CloseClipboard();
+    return text;
 }
 
 void OverlayWindow::ShowToast(const std::wstring& message, const std::wstring& preview) {
@@ -466,9 +511,14 @@ void OverlayWindow::OnPaint() {
         m_brush->SetColor(D2D1::ColorF(0.22f, 0.74f, 0.97f, 0.85f));
         m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(bannerRect, 12.0f, 12.0f), m_brush, 1.5f);
 
-        std::wstring prompt = (m_launchMode == CaptureLaunchMode::QuickSnipCopy)
-            ? L"Quick Snip Mode: Drag over any video/image to immediately copy all text   \x2022   [Esc] Cancel"
-            : L"Selectext Mode: Drag over video/image to detect words   \x2022   [Space / F] Full Screen   \x2022   [Esc] Cancel";
+        std::wstring prompt;
+        if (m_launchMode == CaptureLaunchMode::QuickSnipCopy) {
+            prompt = L"Quick Snip Mode: Drag over any video/image to immediately copy all text   \x2022   [Esc] Cancel";
+        } else if (m_launchMode == CaptureLaunchMode::StitchAppend) {
+            prompt = L"Stitch & Append Mode: Drag over scrolled code to append & merge overlaps   \x2022   [Esc] Cancel";
+        } else {
+            prompt = L"Selectext Mode: Drag over video/image to detect words   \x2022   [Space / F] Full Screen   \x2022   [Esc] Cancel";
+        }
         m_brush->SetColor(D2D1::ColorF(0.95f, 0.98f, 1.0f, 1.0f));
         if (m_bannerTextFormat) {
             m_renderTarget->DrawTextW(prompt.c_str(), static_cast<UINT32>(prompt.length()), m_bannerTextFormat, bannerRect, m_brush);
@@ -670,18 +720,28 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 if (btn.bounds.contains(mx, my)) {
                     switch (btn.id) {
                     case BTN_CODE_MODE:
-                        if (m_settings) m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                        if (m_settings) {
+                            m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                            AppStorage::SaveSettings(*m_settings);
+                        }
                         UpdateHudLayout();
                         CopyCurrentSelection(false);
                         InvalidateRect(hwnd, nullptr, FALSE);
                         break;
                     case BTN_LINE_MODE:
-                        if (m_settings) m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                        if (m_settings) {
+                            m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                            AppStorage::SaveSettings(*m_settings);
+                        }
                         UpdateHudLayout();
                         InvalidateRect(hwnd, nullptr, FALSE);
                         break;
                     case BTN_COPY_ALL:
-                        CopyCurrentSelection(true);
+                        CopyCurrentSelection(true, false);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    case BTN_STITCH_APPEND:
+                        CopyCurrentSelection(true, true);
                         InvalidateRect(hwnd, nullptr, FALSE);
                         break;
                     case BTN_NEW_CROP:
@@ -801,25 +861,37 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 return 0;
             }
         } else if (m_phase == OverlayPhase::InteractiveText) {
+            bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             if (ctrlDown && wParam == 'A') {
-                CopyCurrentSelection(true);
+                CopyCurrentSelection(true, false);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if ((ctrlDown && shiftDown && wParam == 'C') || (!ctrlDown && wParam == 'A')) {
+                CopyCurrentSelection(true, true);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             if ((ctrlDown && wParam == 'C') || wParam == VK_RETURN) {
-                CopyCurrentSelection(false);
+                CopyCurrentSelection(false, false);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             if (!ctrlDown && wParam == 'C') {
-                if (m_settings) m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                if (m_settings) {
+                    m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                    AppStorage::SaveSettings(*m_settings);
+                }
                 UpdateHudLayout();
-                CopyCurrentSelection(false);
+                CopyCurrentSelection(false, false);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
             if (!ctrlDown && wParam == 'L') {
-                if (m_settings) m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                if (m_settings) {
+                    m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                    AppStorage::SaveSettings(*m_settings);
+                }
                 UpdateHudLayout();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;

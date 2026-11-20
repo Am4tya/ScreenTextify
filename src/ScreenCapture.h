@@ -38,6 +38,9 @@ public:
 
     // Loads an image file (PNG/JPG/BMP) into a RawBitmap using GDI+
     static RawBitmap LoadBitmapFromFile(const std::wstring& filePath);
+
+    // Loads an image from the Windows Clipboard (CF_DIBV5/CF_DIB/CF_BITMAP or copied image file via CF_HDROP)
+    static RawBitmap LoadBitmapFromClipboard(HWND hwndOwner);
 };
 
 } // namespace ScreenTextify

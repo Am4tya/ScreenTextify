@@ -1,4 +1,5 @@
 #include "HistoryWindow.h"
+#include "AppStorage.h"
 #include "OverlayWindow.h"
 #include "OcrService.h"
 #include "ScreenCapture.h"
@@ -7,6 +8,7 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -23,17 +25,20 @@ enum ActionId {
     ACT_HERO_REGION     = 101,
     ACT_HERO_FULLSCREEN = 102,
     ACT_HERO_QUICKSNIP  = 103,
+    ACT_HERO_STITCH     = 104,
 
     ACT_TOGGLE_CODE      = 201,
     ACT_TOGGLE_LINEMODE  = 202,
     ACT_TOGGLE_AUTOCOPY  = 203,
     ACT_TOGGLE_UPSCALE   = 204,
     ACT_TOGGLE_AUTOCLOSE = 205,
+    ACT_TOGGLE_STARTWIN  = 206,
 
     ACT_BTN_COPY_CODE   = 301,
     ACT_BTN_SAVE_FILE   = 302,
     ACT_BTN_DEMO_OCR    = 303,
     ACT_BTN_CLEAR_HIST  = 304,
+    ACT_BTN_PASTE_IMG   = 305,
 
     ACT_HIST_ITEM_BASE  = 1000
 };
@@ -117,13 +122,13 @@ bool HistoryWindow::Initialize() {
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassExW(&wc);
 
-    int winW = 1040;
-    int winH = 690;
+    int winW = 1080;
+    int winH = 710;
     int sx = std::max(20, (GetSystemMetrics(SM_CXSCREEN) - winW) / 2);
     int sy = std::max(20, (GetSystemMetrics(SM_CYSCREEN) - winH) / 2);
 
     m_hwnd = CreateWindowExW(
-        0,
+        WS_EX_ACCEPTFILES,
         HISTORY_CLASS_NAME,
         L"ScreenTextify Studio \x2014 Selectext for Desktop Videos & Images",
         WS_OVERLAPPEDWINDOW,
@@ -133,23 +138,32 @@ bool HistoryWindow::Initialize() {
 
     if (!m_hwnd) return false;
 
+    DragAcceptFiles(m_hwnd, TRUE);
+
     BOOL useDarkMode = TRUE;
     DwmSetWindowAttribute(m_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &useDarkMode, sizeof(useDarkMode));
     DWORD cornerPref = 2 /* DWMWCP_ROUND */;
     DwmSetWindowAttribute(m_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &cornerPref, sizeof(cornerPref));
 
-    AddHistoryEntry(
-        L"// Welcome to ScreenTextify Studio!\r\n"
-        L"// Press Alt+Shift+S anytime to freeze a video & select text boxes.\r\n"
-        L"int calculateSum(int n) {\r\n"
-        L"    int total = 0;\r\n"
-        L"    for (int i = 1; i <= n; ++i) {\r\n"
-        L"        total += i;\r\n"
-        L"    }\r\n"
-        L"    return total;\r\n"
-        L"}",
-        true, 23, 18.4
-    );
+    if (!AppStorage::LoadHistory(m_history) || m_history.empty()) {
+        CaptureHistoryItem welcome;
+        welcome.text =
+            L"// Welcome to ScreenTextify Studio!\r\n"
+            L"// Alt+Shift+S: Region Selectext | Alt+Shift+A: Stitch scrolled code\r\n"
+            L"// Tip: Drag & drop any screenshot here or press Ctrl+V to OCR it!\r\n"
+            L"int calculateSum(int n) {\r\n"
+            L"    int total = 0;\r\n"
+            L"    for (int i = 1; i <= n; ++i) {\r\n"
+            L"        total += i;\r\n"
+            L"    }\r\n"
+            L"    return total;\r\n"
+            L"}";
+        welcome.timestamp = L"Welcome";
+        welcome.wasCodeMode = true;
+        welcome.wordCount = 29;
+        welcome.ocrTimeMs = 0.0;
+        m_history.push_back(std::move(welcome));
+    }
 
     return true;
 }
@@ -191,15 +205,31 @@ void HistoryWindow::AddHistoryEntry(const std::wstring& text, bool codeMode, siz
     }
     m_selectedHistoryIdx = 0;
     m_codeScrollY = 0.0f;
+    AppStorage::SaveHistory(m_history);
 
     if (m_hwnd) {
         InvalidateRect(m_hwnd, nullptr, FALSE);
     }
 }
 
-void HistoryWindow::RunBuiltInDemoCapture() {
-    RawBitmap frame = ScreenCapture::CreateSyntheticCodeFrame(800, 390);
-    RawBitmap scaled = ScreenCapture::CropAndScale(frame, { 0.0f, 0.0f, 800.0f, 390.0f }, 2);
+void HistoryWindow::RunOcrOnBitmap(const RawBitmap& bmp, const std::wstring& sourceLabel) {
+    if (!bmp.valid()) {
+        m_statusBanner = L"Could not load image from " + sourceLabel + L".";
+        m_statusFlashTick = GetTickCount64() + 3000;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    int scale = 1;
+    if (!m_settings || m_settings->upscaleForOcr) {
+        if (bmp.width < 320 && bmp.height < 120) scale = 3;
+        else if (bmp.width < 1500 && bmp.height < 950) scale = 2;
+    }
+
+    RawBitmap scaled = ScreenCapture::CropAndScale(
+        bmp, { 0.0f, 0.0f, static_cast<float>(bmp.width), static_cast<float>(bmp.height) }, scale
+    );
     std::wstring err;
     OcrDocument doc = OcrService::RecognizeBitmap(scaled, &err);
     if (!doc.empty()) {
@@ -208,10 +238,29 @@ void HistoryWindow::RunBuiltInDemoCapture() {
         std::wstring formatted = TextFormatter::FormatDocument(doc, false, codeOn, &wc);
         OverlayWindow::CopyTextToClipboard(m_hwnd, formatted);
         AddHistoryEntry(formatted, codeOn, wc, doc.recognitionTimeMs);
-        m_statusBanner = L"\x2713 Live Demo OCR completed in " + std::to_wstring(static_cast<int>(doc.recognitionTimeMs)) + L" ms & copied to clipboard!";
-        m_statusFlashTick = GetTickCount64() + 3500;
-        InvalidateRect(m_hwnd, nullptr, FALSE);
+        m_statusBanner = L"\x2713 OCR from " + sourceLabel + L" (" + std::to_wstring(wc) +
+                         L" words in " + std::to_wstring(static_cast<int>(doc.recognitionTimeMs)) + L" ms) \x2014 copied to clipboard!";
+    } else {
+        m_statusBanner = err.empty() ? (L"No text detected in " + sourceLabel + L".") : err;
     }
+    m_statusFlashTick = GetTickCount64() + 3800;
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+}
+
+void HistoryWindow::RunOcrFromClipboard() {
+    RawBitmap clipBmp = ScreenCapture::LoadBitmapFromClipboard(m_hwnd);
+    if (!clipBmp.valid()) {
+        m_statusBanner = L"Clipboard does not contain an image. Copy a screenshot or image file first, then press Ctrl+V.";
+        m_statusFlashTick = GetTickCount64() + 3200;
+        InvalidateRect(m_hwnd, nullptr, FALSE);
+        return;
+    }
+    RunOcrOnBitmap(clipBmp, L"Clipboard Image");
+}
+
+void HistoryWindow::RunBuiltInDemoCapture() {
+    RawBitmap frame = ScreenCapture::CreateSyntheticCodeFrame(800, 390);
+    RunOcrOnBitmap(frame, L"Live Demo Code");
 }
 
 void HistoryWindow::SaveSelectedCaptureToFile() {
@@ -287,9 +336,9 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
     float pad = 24.0f;
     float contentW = std::max(640.0f, width - pad * 2.0f);
 
-    // 1. Three Hero Capture Action Cards (y = 78 .. 174, height = 96)
-    float cardGap = 14.0f;
-    float cardW = (contentW - cardGap * 2.0f) / 3.0f;
+    // 1. Four Hero Capture Action Cards (y = 78 .. 174, height = 96)
+    float cardGap = 12.0f;
+    float cardW = (contentW - cardGap * 3.0f) / 4.0f;
     float cardY = 78.0f;
     float cardH = 96.0f;
 
@@ -297,7 +346,7 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
         ACT_HERO_REGION,
         { pad, cardY, cardW, cardH },
         L"Region Selectext",
-        L"Freeze video & select highlighted words",
+        L"Freeze video & select words",
         L"Alt + Shift + S",
         false
     });
@@ -306,7 +355,7 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
         ACT_HERO_FULLSCREEN,
         { pad + cardW + cardGap, cardY, cardW, cardH },
         L"Full-Screen Selectext",
-        L"Detect all text boxes on active monitor",
+        L"Detect all text on monitor",
         L"Alt + Shift + D",
         false
     });
@@ -315,16 +364,25 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
         ACT_HERO_QUICKSNIP,
         { pad + (cardW + cardGap) * 2.0f, cardY, cardW, cardH },
         L"Quick Snip & Copy",
-        L"Drag a box to copy all text inside in 1 step",
+        L"Drag box to copy in 1 step",
         L"Alt + Shift + C",
         false
     });
 
-    // 2. Left Column: Settings Toggle Switches (x = pad, width = 345)
+    m_hotspots.push_back({
+        ACT_HERO_STITCH,
+        { pad + (cardW + cardGap) * 3.0f, cardY, cardW, cardH },
+        L"Stitch & Append",
+        L"Merge scrolled video code",
+        L"Alt + Shift + A",
+        false
+    });
+
+    // 2. Left Column: Six Settings Toggle Switches (x = pad, width = 345)
     float leftColW = 345.0f;
     float toggleY = 220.0f;
-    float toggleH = 54.0f;
-    float toggleGap = 8.0f;
+    float toggleH = 48.0f;
+    float toggleGap = 7.0f;
 
     struct ToggleDef {
         int id;
@@ -337,10 +395,11 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
         { ACT_TOGGLE_LINEMODE,  L"Full-Line Selection Mode",    L"Select entire lines instead of single words" },
         { ACT_TOGGLE_AUTOCOPY,  L"Auto-Copy on Mouse Release",  L"Copies immediately when drag selection ends" },
         { ACT_TOGGLE_UPSCALE,   L"2x Super-Res & Dark Boost",   L"Enhances compressed dark-mode video frames" },
-        { ACT_TOGGLE_AUTOCLOSE, L"Auto-Close Overlay on Copy",  L"Closes overlay right after first copy" }
+        { ACT_TOGGLE_AUTOCLOSE, L"Auto-Close Overlay on Copy",  L"Closes overlay right after first copy" },
+        { ACT_TOGGLE_STARTWIN,  L"Start with Windows (Tray)",   L"Auto-launch silently in tray on login" }
     };
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         m_hotspots.push_back({
             toggles[i].id,
             { pad, toggleY + i * (toggleH + toggleGap), leftColW, toggleH },
@@ -351,11 +410,19 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
         });
     }
 
-    float demoY = toggleY + 5 * (toggleH + toggleGap) + 6.0f;
+    float actionY = toggleY + 6 * (toggleH + toggleGap) + 6.0f;
+    m_hotspots.push_back({
+        ACT_BTN_PASTE_IMG,
+        { pad, actionY, 178.0f, 38.0f },
+        L"Paste Image (Ctrl+V)",
+        L"",
+        L"",
+        false
+    });
     m_hotspots.push_back({
         ACT_BTN_DEMO_OCR,
-        { pad, demoY, leftColW, 40.0f },
-        L"\x26A1 Run Live Code OCR Self-Test",
+        { pad + 186.0f, actionY, leftColW - 186.0f, 38.0f },
+        L"\x26A1 Live Self-Test",
         L"",
         L"",
         false
@@ -483,19 +550,23 @@ void HistoryWindow::OnPaint() {
     for (const auto& hs : m_hotspots) {
         D2D1_RECT_F r = D2D1::RectF(hs.bounds.x, hs.bounds.y, hs.bounds.right(), hs.bounds.bottom());
 
-        if (hs.id == ACT_HERO_REGION || hs.id == ACT_HERO_FULLSCREEN || hs.id == ACT_HERO_QUICKSNIP) {
+        if (hs.id == ACT_HERO_REGION || hs.id == ACT_HERO_FULLSCREEN || hs.id == ACT_HERO_QUICKSNIP || hs.id == ACT_HERO_STITCH) {
             bool isPrimary = (hs.id == ACT_HERO_REGION);
+            bool isStitch = (hs.id == ACT_HERO_STITCH);
             if (hs.hovered) {
-                m_brush->SetColor(isPrimary ? D2D1::ColorF(0.10f, 0.24f, 0.46f, 0.95f) : D2D1::ColorF(0.11f, 0.16f, 0.26f, 0.95f));
+                m_brush->SetColor(isPrimary ? D2D1::ColorF(0.10f, 0.24f, 0.46f, 0.95f)
+                    : (isStitch ? D2D1::ColorF(0.08f, 0.24f, 0.22f, 0.95f) : D2D1::ColorF(0.11f, 0.16f, 0.26f, 0.95f)));
             } else {
-                m_brush->SetColor(isPrimary ? D2D1::ColorF(0.08f, 0.18f, 0.36f, 0.90f) : D2D1::ColorF(0.075f, 0.105f, 0.175f, 0.92f));
+                m_brush->SetColor(isPrimary ? D2D1::ColorF(0.08f, 0.18f, 0.36f, 0.90f)
+                    : (isStitch ? D2D1::ColorF(0.06f, 0.16f, 0.16f, 0.92f) : D2D1::ColorF(0.075f, 0.105f, 0.175f, 0.92f)));
             }
             m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(r, 10.0f, 10.0f), m_brush);
 
             m_brush->SetColor(hs.hovered
-                ? D2D1::ColorF(0.32f, 0.78f, 1.0f, 0.95f)
-                : (isPrimary ? D2D1::ColorF(0.20f, 0.60f, 0.95f, 0.75f) : D2D1::ColorF(0.16f, 0.22f, 0.34f, 0.85f)));
-            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(r, 10.0f, 10.0f), m_brush, isPrimary ? 1.6f : 1.2f);
+                ? (isStitch ? D2D1::ColorF(0.24f, 0.90f, 0.72f, 0.95f) : D2D1::ColorF(0.32f, 0.78f, 1.0f, 0.95f))
+                : (isPrimary ? D2D1::ColorF(0.20f, 0.60f, 0.95f, 0.75f)
+                    : (isStitch ? D2D1::ColorF(0.16f, 0.68f, 0.54f, 0.70f) : D2D1::ColorF(0.16f, 0.22f, 0.34f, 0.85f))));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(r, 10.0f, 10.0f), m_brush, (isPrimary || isStitch) ? 1.5f : 1.2f);
 
             // Clip strictly inside the card so nothing can ever overflow
             m_renderTarget->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -504,9 +575,9 @@ void HistoryWindow::OnPaint() {
             D2D1_RECT_F kbRect = D2D1::RectF(hs.bounds.x + 14.0f, hs.bounds.y + 11.0f, hs.bounds.x + 124.0f, hs.bounds.y + 33.0f);
             m_brush->SetColor(D2D1::ColorF(0.045f, 0.075f, 0.135f, 0.95f));
             m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(kbRect, 5.0f, 5.0f), m_brush);
-            m_brush->SetColor(D2D1::ColorF(0.22f, 0.62f, 0.95f, 0.50f));
+            m_brush->SetColor(isStitch ? D2D1::ColorF(0.18f, 0.78f, 0.62f, 0.55f) : D2D1::ColorF(0.22f, 0.62f, 0.95f, 0.50f));
             m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(kbRect, 5.0f, 5.0f), m_brush, 1.0f);
-            m_brush->SetColor(D2D1::ColorF(0.42f, 0.85f, 1.0f, 1.0f));
+            m_brush->SetColor(isStitch ? D2D1::ColorF(0.34f, 0.95f, 0.75f, 1.0f) : D2D1::ColorF(0.42f, 0.85f, 1.0f, 1.0f));
             if (m_badgeFormat) {
                 m_renderTarget->DrawTextW(hs.badge.c_str(), static_cast<UINT32>(hs.badge.length()), m_badgeFormat, kbRect, m_brush);
             }
@@ -526,7 +597,7 @@ void HistoryWindow::OnPaint() {
             }
 
             m_renderTarget->PopAxisAlignedClip();
-        } else if (hs.id >= ACT_TOGGLE_CODE && hs.id <= ACT_TOGGLE_AUTOCLOSE) {
+        } else if (hs.id >= ACT_TOGGLE_CODE && hs.id <= ACT_TOGGLE_STARTWIN) {
             bool isOn = false;
             if (m_settings) {
                 if (hs.id == ACT_TOGGLE_CODE) isOn = m_settings->codeIndentationMode;
@@ -534,6 +605,7 @@ void HistoryWindow::OnPaint() {
                 else if (hs.id == ACT_TOGGLE_AUTOCOPY) isOn = m_settings->autoCopyOnRelease;
                 else if (hs.id == ACT_TOGGLE_UPSCALE) isOn = m_settings->upscaleForOcr;
                 else if (hs.id == ACT_TOGGLE_AUTOCLOSE) isOn = m_settings->autoCloseAfterCopy;
+                else if (hs.id == ACT_TOGGLE_STARTWIN) isOn = m_settings->startWithWindows;
             }
 
             m_brush->SetColor(hs.hovered ? D2D1::ColorF(0.10f, 0.14f, 0.22f, 0.95f) : D2D1::ColorF(0.07f, 0.10f, 0.16f, 0.90f));
@@ -545,31 +617,31 @@ void HistoryWindow::OnPaint() {
 
             m_brush->SetColor(D2D1::ColorF(0.94f, 0.97f, 1.0f, 1.0f));
             if (m_cardTitleFormat) {
-                D2D1_RECT_F tr = D2D1::RectF(hs.bounds.x + 14.0f, hs.bounds.y + 8.0f, hs.bounds.right() - 68.0f, hs.bounds.y + 28.0f);
+                D2D1_RECT_F tr = D2D1::RectF(hs.bounds.x + 14.0f, hs.bounds.y + 6.0f, hs.bounds.right() - 68.0f, hs.bounds.y + 25.0f);
                 m_renderTarget->DrawTextW(hs.title.c_str(), static_cast<UINT32>(hs.title.length()), m_cardTitleFormat, tr, m_brush);
             }
             m_brush->SetColor(D2D1::ColorF(0.56f, 0.64f, 0.76f, 1.0f));
             if (m_bodyFormat) {
-                D2D1_RECT_F dr = D2D1::RectF(hs.bounds.x + 14.0f, hs.bounds.y + 30.0f, hs.bounds.right() - 68.0f, hs.bounds.bottom() - 6.0f);
+                D2D1_RECT_F dr = D2D1::RectF(hs.bounds.x + 14.0f, hs.bounds.y + 26.0f, hs.bounds.right() - 68.0f, hs.bounds.bottom() - 4.0f);
                 m_renderTarget->DrawTextW(hs.subtitle.c_str(), static_cast<UINT32>(hs.subtitle.length()), m_bodyFormat, dr, m_brush);
             }
 
-            float swW = 44.0f;
-            float swH = 24.0f;
+            float swW = 42.0f;
+            float swH = 22.0f;
             float swX = hs.bounds.right() - swW - 14.0f;
             float swY = hs.bounds.centerY() - swH * 0.5f;
             D2D1_RECT_F swRect = D2D1::RectF(swX, swY, swX + swW, swY + swH);
             m_brush->SetColor(isOn ? D2D1::ColorF(0.14f, 0.56f, 0.96f, 1.0f) : D2D1::ColorF(0.18f, 0.24f, 0.34f, 1.0f));
-            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(swRect, 12.0f, 12.0f), m_brush);
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(swRect, 11.0f, 11.0f), m_brush);
 
-            float knobX = isOn ? (swX + swW - 12.0f) : (swX + 12.0f);
-            float knobY = swY + 12.0f;
+            float knobX = isOn ? (swX + swW - 11.0f) : (swX + 11.0f);
+            float knobY = swY + 11.0f;
             m_brush->SetColor(D2D1::ColorF(0.98f, 0.99f, 1.0f, 1.0f));
-            m_renderTarget->FillEllipse(D2D1::Ellipse({ knobX, knobY }, 8.5f, 8.5f), m_brush);
+            m_renderTarget->FillEllipse(D2D1::Ellipse({ knobX, knobY }, 7.8f, 7.8f), m_brush);
 
             m_renderTarget->PopAxisAlignedClip();
-        } else if (hs.id == ACT_BTN_DEMO_OCR || hs.id == ACT_BTN_COPY_CODE || hs.id == ACT_BTN_SAVE_FILE || hs.id == ACT_BTN_CLEAR_HIST) {
-            bool accent = (hs.id == ACT_BTN_COPY_CODE || hs.id == ACT_BTN_DEMO_OCR);
+        } else if (hs.id == ACT_BTN_DEMO_OCR || hs.id == ACT_BTN_PASTE_IMG || hs.id == ACT_BTN_COPY_CODE || hs.id == ACT_BTN_SAVE_FILE || hs.id == ACT_BTN_CLEAR_HIST) {
+            bool accent = (hs.id == ACT_BTN_COPY_CODE || hs.id == ACT_BTN_PASTE_IMG);
             if (hs.hovered) {
                 m_brush->SetColor(accent ? D2D1::ColorF(0.16f, 0.52f, 0.96f, 0.95f) : D2D1::ColorF(0.18f, 0.24f, 0.35f, 0.95f));
             } else {
@@ -723,7 +795,7 @@ void HistoryWindow::OnPaint() {
 
     std::wstring footer = (m_statusFlashTick > GetTickCount64() && !m_statusBanner.empty())
         ? m_statusBanner
-        : L"Tip: Closing this window keeps ScreenTextify running in your System Tray. Overlay keys: [C] Code Indent, [L] Line Mode, [R] Re-Crop.";
+        : L"Tip: Drop any image file here or press Ctrl+V to OCR it. Overlay keys: [A] Stitch Append, [C] Code Indent, [L] Line Mode, [R] Re-Crop.";
     if (m_bodyFormat) {
         m_brush->SetColor((m_statusFlashTick > GetTickCount64())
             ? D2D1::ColorF(0.28f, 0.95f, 0.68f, 1.0f)
@@ -771,9 +843,43 @@ LRESULT HistoryWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = 880;
-        mmi->ptMinTrackSize.y = 620;
+        mmi->ptMinTrackSize.x = 920;
+        mmi->ptMinTrackSize.y = 656;
         return 0;
+    }
+
+    case WM_DROPFILES: {
+        HDROP hDrop = reinterpret_cast<HDROP>(wParam);
+        if (hDrop) {
+            wchar_t pathBuf[MAX_PATH * 2] = {};
+            if (DragQueryFileW(hDrop, 0, pathBuf, static_cast<UINT>(std::size(pathBuf))) > 0) {
+                std::wstring filePath = pathBuf;
+                RawBitmap bmp = ScreenCapture::LoadBitmapFromFile(filePath);
+                size_t slash = filePath.find_last_of(L"\\/");
+                std::wstring fileName = (slash != std::wstring::npos) ? filePath.substr(slash + 1) : filePath;
+                RunOcrOnBitmap(bmp, fileName);
+            }
+            DragFinish(hDrop);
+        }
+        return 0;
+    }
+
+    case WM_KEYDOWN: {
+        bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrlDown && wParam == 'V') {
+            RunOcrFromClipboard();
+            return 0;
+        }
+        if (ctrlDown && wParam == 'C') {
+            if (!m_history.empty() && m_selectedHistoryIdx >= 0 && static_cast<size_t>(m_selectedHistoryIdx) < m_history.size()) {
+                OverlayWindow::CopyTextToClipboard(hwnd, m_history[m_selectedHistoryIdx].text);
+                m_statusBanner = L"\x2713 Copied selected snippet to Clipboard!";
+                m_statusFlashTick = GetTickCount64() + 2800;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        break;
     }
 
     case WM_PAINT: {
@@ -842,21 +948,45 @@ LRESULT HistoryWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     ShowWindow(hwnd, SW_HIDE);
                     Sleep(90);
                     if (m_onStartCapture) m_onStartCapture(CaptureLaunchMode::QuickSnipCopy);
+                } else if (hs.id == ACT_HERO_STITCH) {
+                    ShowWindow(hwnd, SW_HIDE);
+                    Sleep(90);
+                    if (m_onStartCapture) m_onStartCapture(CaptureLaunchMode::StitchAppend);
                 } else if (hs.id == ACT_TOGGLE_CODE && m_settings) {
                     m_settings->codeIndentationMode = !m_settings->codeIndentationMode;
+                    AppStorage::SaveSettings(*m_settings);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 } else if (hs.id == ACT_TOGGLE_LINEMODE && m_settings) {
                     m_settings->lineSelectionMode = !m_settings->lineSelectionMode;
+                    AppStorage::SaveSettings(*m_settings);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 } else if (hs.id == ACT_TOGGLE_AUTOCOPY && m_settings) {
                     m_settings->autoCopyOnRelease = !m_settings->autoCopyOnRelease;
+                    AppStorage::SaveSettings(*m_settings);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 } else if (hs.id == ACT_TOGGLE_UPSCALE && m_settings) {
                     m_settings->upscaleForOcr = !m_settings->upscaleForOcr;
+                    AppStorage::SaveSettings(*m_settings);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 } else if (hs.id == ACT_TOGGLE_AUTOCLOSE && m_settings) {
                     m_settings->autoCloseAfterCopy = !m_settings->autoCloseAfterCopy;
+                    AppStorage::SaveSettings(*m_settings);
                     InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (hs.id == ACT_TOGGLE_STARTWIN && m_settings) {
+                    bool target = !m_settings->startWithWindows;
+                    if (AppStorage::SetStartWithWindows(target)) {
+                        m_settings->startWithWindows = target;
+                        AppStorage::SaveSettings(*m_settings);
+                        m_statusBanner = target
+                            ? L"\x2713 Enabled Start with Windows (launches silently in System Tray)."
+                            : L"Disabled Start with Windows.";
+                    } else {
+                        m_statusBanner = L"Could not update Windows startup registry key.";
+                    }
+                    m_statusFlashTick = GetTickCount64() + 3000;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else if (hs.id == ACT_BTN_PASTE_IMG) {
+                    RunOcrFromClipboard();
                 } else if (hs.id == ACT_BTN_DEMO_OCR) {
                     RunBuiltInDemoCapture();
                 } else if (hs.id == ACT_BTN_COPY_CODE) {
@@ -872,6 +1002,7 @@ LRESULT HistoryWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     m_history.clear();
                     m_selectedHistoryIdx = 0;
                     m_codeScrollY = 0.0f;
+                    AppStorage::SaveHistory(m_history);
                     m_statusBanner = L"Cleared capture history.";
                     m_statusFlashTick = GetTickCount64() + 2500;
                     InvalidateRect(hwnd, nullptr, FALSE);

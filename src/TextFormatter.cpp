@@ -1,7 +1,9 @@
 #include "TextFormatter.h"
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <numeric>
+#include <sstream>
 
 namespace ScreenTextify {
 
@@ -246,6 +248,117 @@ std::wstring TextFormatter::FormatDocument(
     }
 
     return output;
+}
+
+namespace {
+
+std::vector<std::wstring> SplitLines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    std::wstringstream ss(text);
+    std::wstring line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == L'\r') line.pop_back();
+        lines.push_back(std::move(line));
+    }
+    while (!lines.empty() && lines.back().empty()) lines.pop_back();
+    return lines;
+}
+
+std::wstring TrimSpaces(const std::wstring& s) {
+    size_t start = 0;
+    while (start < s.size() && std::iswspace(s[start])) ++start;
+    size_t end = s.size();
+    while (end > start && std::iswspace(s[end - 1])) --end;
+    return s.substr(start, end - start);
+}
+
+size_t LineEditDistance(const std::wstring& a, const std::wstring& b) {
+    const size_t n = a.size(), m = b.size();
+    std::vector<size_t> prev(m + 1), cur(m + 1);
+    for (size_t j = 0; j <= m; ++j) prev[j] = j;
+    for (size_t i = 1; i <= n; ++i) {
+        cur[0] = i;
+        for (size_t j = 1; j <= m; ++j) {
+            size_t cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost });
+        }
+        prev.swap(cur);
+    }
+    return prev[m];
+}
+
+bool LinesFuzzyMatch(const std::wstring& a, const std::wstring& b) {
+    std::wstring ta = TrimSpaces(a);
+    std::wstring tb = TrimSpaces(b);
+    if (ta == tb) return true;
+    if (ta.empty() || tb.empty()) return false;
+    size_t maxLen = std::max(ta.size(), tb.size());
+    if (maxLen < 6) return false; // Short lines like "}" or ")" must match exactly
+    size_t dist = LineEditDistance(ta, tb);
+    return dist <= std::max<size_t>(1, maxLen / 6); // <= ~16% tolerance for minor video blur
+}
+
+} // namespace
+
+std::wstring TextFormatter::StitchCodeBlocks(
+    const std::wstring& existingText,
+    const std::wstring& newText,
+    int* outOverlapLines,
+    int* outAppendedLines
+) {
+    auto aLines = SplitLines(existingText);
+    auto bLines = SplitLines(newText);
+
+    if (outOverlapLines) *outOverlapLines = 0;
+    if (outAppendedLines) *outAppendedLines = static_cast<int>(bLines.size());
+
+    if (aLines.empty()) return newText;
+    if (bLines.empty()) {
+        if (outAppendedLines) *outAppendedLines = 0;
+        return existingText;
+    }
+
+    // Find the largest overlap k where the last k lines of aLines match the first k lines of bLines.
+    size_t maxK = std::min({ aLines.size(), bLines.size(), static_cast<size_t>(20) });
+    size_t bestK = 0;
+    for (size_t k = maxK; k >= 1; --k) {
+        bool allMatch = true;
+        int nonEmptyCount = 0;
+        size_t totalChars = 0;
+        for (size_t i = 0; i < k; ++i) {
+            const auto& la = aLines[aLines.size() - k + i];
+            const auto& lb = bLines[i];
+            if (!LinesFuzzyMatch(la, lb)) {
+                allMatch = false;
+                break;
+            }
+            std::wstring ta = TrimSpaces(la);
+            if (!ta.empty()) {
+                ++nonEmptyCount;
+                totalChars += ta.size();
+            }
+        }
+        // Require at least 1 meaningful line (or >= 4 chars) so a single "}" doesn't falsely merge unrelated blocks
+        if (allMatch && (k >= 2 || (nonEmptyCount >= 1 && totalChars >= 4))) {
+            bestK = k;
+            break;
+        }
+    }
+
+    int appended = static_cast<int>(bLines.size() - bestK);
+    if (outOverlapLines) *outOverlapLines = static_cast<int>(bestK);
+    if (outAppendedLines) *outAppendedLines = appended;
+
+    std::wstring result;
+    for (size_t i = 0; i < aLines.size(); ++i) {
+        if (i > 0) result += L"\r\n";
+        result += aLines[i];
+    }
+    for (size_t i = bestK; i < bLines.size(); ++i) {
+        if (!result.empty()) result += L"\r\n";
+        result += bLines[i];
+    }
+    return result;
 }
 
 } // namespace ScreenTextify
