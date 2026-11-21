@@ -19,6 +19,7 @@ add_executable(ScreenTextify WIN32
     src/OcrService.cpp
     src/PaddleOcr.cpp
     src/TextFormatter.cpp
+    src/SyntaxHighlighter.cpp
     src/OverlayWindow.cpp
     src/HistoryWindow.cpp
 )

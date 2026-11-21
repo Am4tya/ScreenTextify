@@ -2,6 +2,7 @@
 #include "AppStorage.h"
 #include "OcrService.h"
 #include "TextFormatter.h"
+#include "UiTheme.h"
 
 #include <windowsx.h>
 #include <algorithm>
@@ -587,55 +588,64 @@ void OverlayWindow::OnPaint() {
             }
         }
 
-        // Draw Floating HUD Toolbar
+        // Draw Floating HUD Toolbar with soft drop shadow & specular top edge
         D2D1_RECT_F hudRect = D2D1::RectF(m_hudBarRect.x, m_hudBarRect.y, m_hudBarRect.right(), m_hudBarRect.bottom());
-        m_brush->SetColor(D2D1::ColorF(0.05f, 0.08f, 0.14f, 0.95f));
-        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(hudRect, 10.0f, 10.0f), m_brush);
-        m_brush->SetColor(D2D1::ColorF(0.22f, 0.36f, 0.58f, 0.88f));
-        m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(hudRect, 10.0f, 10.0f), m_brush, 1.3f);
+        UiTheme::DrawSoftShadow(m_renderTarget, m_brush, hudRect, 11.0f, 1.0f);
+        m_brush->SetColor(D2D1::ColorF(0.047f, 0.067f, 0.114f, 0.96f));
+        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(hudRect, 11.0f, 11.0f), m_brush);
+        m_brush->SetColor(UiTheme::TopSpecular);
+        m_renderTarget->DrawLine({ hudRect.left + 12.0f, hudRect.top + 0.75f }, { hudRect.right - 12.0f, hudRect.top + 0.75f }, m_brush, 1.0f);
+        m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentPrimary, 0.48f));
+        m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(hudRect, 11.0f, 11.0f), m_brush, 1.25f);
 
         // Metrics pill on left of HUD
         D2D1_RECT_F metricsRect = D2D1::RectF(m_hudBarRect.x + 8.0f, m_hudBarRect.y + 6.0f, m_hudBarRect.x + 140.0f, m_hudBarRect.bottom() - 6.0f);
-        m_brush->SetColor(D2D1::ColorF(0.08f, 0.14f, 0.24f, 0.90f));
-        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(metricsRect, 6.0f, 6.0f), m_brush);
-        m_brush->SetColor(D2D1::ColorF(0.38f, 0.82f, 0.98f, 1.0f));
+        m_brush->SetColor(UiTheme::BgCanvas);
+        m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(metricsRect, 7.0f, 7.0f), m_brush);
+        m_brush->SetColor(UiTheme::BorderSubtle);
+        m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(metricsRect, 7.0f, 7.0f), m_brush, 1.0f);
+        m_brush->SetColor(UiTheme::AccentPrimary);
         if (m_hudTextFormat) {
             m_renderTarget->DrawTextW(m_hudMetricsText.c_str(), static_cast<UINT32>(m_hudMetricsText.length()), m_hudTextFormat, metricsRect, m_brush);
         }
 
         for (const auto& btn : m_hudButtons) {
             D2D1_RECT_F br = D2D1::RectF(btn.bounds.x, btn.bounds.y, btn.bounds.right(), btn.bounds.bottom());
+            bool isStitchBtn = (btn.id == BTN_STITCH_APPEND);
             if (btn.active) {
-                m_brush->SetColor(D2D1::ColorF(0.12f, 0.45f, 0.90f, 0.92f));
+                m_brush->SetColor(isStitchBtn ? D2D1::ColorF(0.08f, 0.56f, 0.42f, 0.94f) : D2D1::ColorF(0.12f, 0.42f, 0.90f, 0.94f));
             } else if (btn.hovered) {
-                m_brush->SetColor(D2D1::ColorF(0.18f, 0.26f, 0.40f, 0.95f));
+                m_brush->SetColor(UiTheme::BgSurfaceHover);
             } else {
-                m_brush->SetColor(D2D1::ColorF(0.10f, 0.15f, 0.24f, 0.90f));
+                m_brush->SetColor(UiTheme::BgSurface);
             }
-            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(br, 6.0f, 6.0f), m_brush);
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(br, 7.0f, 7.0f), m_brush);
 
-            m_brush->SetColor(btn.active ? D2D1::ColorF(0.45f, 0.80f, 1.0f, 0.95f) : D2D1::ColorF(0.26f, 0.35f, 0.50f, 0.70f));
-            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(br, 6.0f, 6.0f), m_brush, 1.0f);
+            m_brush->SetColor(btn.active
+                ? (isStitchBtn ? UiTheme::AccentEmerald : UiTheme::AccentPrimary)
+                : (btn.hovered ? UiTheme::WithAlpha(UiTheme::AccentPrimary, 0.55f) : UiTheme::BorderSubtle));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(br, 7.0f, 7.0f), m_brush, 1.0f);
 
-            m_brush->SetColor(D2D1::ColorF(0.95f, 0.98f, 1.0f, 1.0f));
+            m_brush->SetColor(UiTheme::TextPrimary);
             if (m_hudTextFormat) {
                 m_renderTarget->DrawTextW(btn.label.c_str(), static_cast<UINT32>(btn.label.length()), m_hudTextFormat, br, m_brush);
             }
         }
 
-        // Draw Copied Toast & Live Code Preview Card
+        // Draw Copied Toast & Live Code Preview Card with drop shadow
         if (m_toastExpireTick > GetTickCount64() && !m_toastTitle.empty()) {
-            float toastW = 560.0f;
-            float toastH = m_toastPreview.empty() ? 48.0f : 148.0f;
+            float toastW = 580.0f;
+            float toastH = m_toastPreview.empty() ? 48.0f : 154.0f;
             float tx = std::clamp(m_activeScanRegion.centerX() - toastW * 0.5f, 20.0f, std::max(20.0f, fullW - toastW - 20.0f));
             float ty = std::min(fullH - toastH - 24.0f, m_activeScanRegion.bottom() + 62.0f);
             if (ty < 64.0f) ty = 64.0f;
 
             D2D1_RECT_F toastRect = D2D1::RectF(tx, ty, tx + toastW, ty + toastH);
-            m_brush->SetColor(D2D1::ColorF(0.04f, 0.09f, 0.15f, 0.97f));
-            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(toastRect, 10.0f, 10.0f), m_brush);
-            m_brush->SetColor(D2D1::ColorF(0.18f, 0.85f, 0.62f, 0.95f));
-            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(toastRect, 10.0f, 10.0f), m_brush, 1.8f);
+            UiTheme::DrawSoftShadow(m_renderTarget, m_brush, toastRect, 12.0f, 1.2f);
+            m_brush->SetColor(D2D1::ColorF(0.043f, 0.067f, 0.110f, 0.97f));
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(toastRect, 12.0f, 12.0f), m_brush);
+            m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentEmerald, 0.90f));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(toastRect, 12.0f, 12.0f), m_brush, 1.6f);
 
             D2D1_RECT_F titleRect = D2D1::RectF(tx + 14.0f, ty + 8.0f, tx + toastW - 14.0f, ty + 34.0f);
             m_brush->SetColor(D2D1::ColorF(0.32f, 0.96f, 0.70f, 1.0f));
