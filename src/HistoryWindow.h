@@ -24,7 +24,13 @@ public:
 
     bool Initialize();
     void ShowAndFocus();
-    void AddHistoryEntry(const std::wstring& text, bool codeMode, size_t wordCount, double ocrTimeMs);
+    void AddHistoryEntry(
+        const std::wstring& text,
+        bool codeMode,
+        size_t wordCount,
+        double ocrTimeMs,
+        const std::vector<std::wstring>& uncertainWords = {}
+    );
     void RefreshControls();
     HWND GetHwnd() const { return m_hwnd; }
 
@@ -99,7 +105,7 @@ private:
     bool m_animTimerActive = false;
     ULONGLONG m_lastAnimTick = 0;
     std::unordered_map<int, float> m_hoverAnim;
-    float m_toggleAnim[6] = {};
+    float m_toggleAnim[8] = {};
 
     // Status toast state
     std::wstring m_ocrLangName;

@@ -75,6 +75,114 @@ RawBitmap ScreenCapture::CaptureVirtualScreen() {
     return result;
 }
 
+namespace {
+
+// Keys' cubic kernel (B = 0, C = 0.30): interpolatory (exact at sample centers, zero blur)
+// with gentle negative lobes so 1px punctuation ('.', ';', '//') stays razor-sharp without ringing.
+inline float BicubicWeight(float x) {
+    x = std::fabs(x);
+    constexpr float B = 0.0f;
+    constexpr float C = 0.30f;
+    if (x < 1.0f) {
+        return ((12.0f - 9.0f * B - 6.0f * C) * x * x * x +
+                (-18.0f + 12.0f * B + 6.0f * C) * x * x +
+                (6.0f - 2.0f * B)) / 6.0f;
+    }
+    if (x < 2.0f) {
+        return ((-B - 6.0f * C) * x * x * x +
+                (6.0f * B + 30.0f * C) * x * x +
+                (-12.0f * B - 48.0f * C) * x +
+                (8.0f * B + 24.0f * C)) / 6.0f;
+    }
+    return 0.0f;
+}
+
+} // namespace
+
+RectF ScreenCapture::SmartExpandCropRegion(const RawBitmap& source, const RectF& region, int maxPadPx) {
+    RectF norm = region.normalized();
+    if (!source.valid() || maxPadPx <= 0) return norm;
+
+    int x0 = std::clamp(static_cast<int>(std::floor(norm.x)), 0, source.width - 1);
+    int y0 = std::clamp(static_cast<int>(std::floor(norm.y)), 0, source.height - 1);
+    int x1 = std::clamp(static_cast<int>(std::ceil(norm.right())), x0 + 1, source.width);
+    int y1 = std::clamp(static_cast<int>(std::ceil(norm.bottom())), y0 + 1, source.height);
+
+    // Estimate background color inside the crop using luminance quantiles
+    struct Px { int lum, r, g, b; };
+    std::vector<Px> samples;
+    int stepX = std::max(1, (x1 - x0) / 32);
+    int stepY = std::max(1, (y1 - y0) / 24);
+    samples.reserve(800);
+    for (int y = y0; y < y1; y += stepY) {
+        const uint8_t* row = source.pixels.data() + static_cast<size_t>(y) * source.stride;
+        for (int x = x0; x < x1; x += stepX) {
+            int b = row[x * 4 + 0], g = row[x * 4 + 1], r = row[x * 4 + 2];
+            int lum = (r * 77 + g * 150 + b * 29) >> 8;
+            samples.push_back({ lum, r, g, b });
+        }
+    }
+    if (samples.empty()) return norm;
+
+    int64_t lumSum = 0;
+    for (const auto& s : samples) lumSum += s.lum;
+    bool isDark = (lumSum / static_cast<int64_t>(samples.size())) < 140;
+    size_t bgIdx = isDark ? (samples.size() / 4) : ((samples.size() * 3) / 4);
+    std::nth_element(samples.begin(), samples.begin() + bgIdx, samples.end(),
+                     [](const Px& a, const Px& b) { return a.lum < b.lum; });
+    const Px bg = samples[bgIdx];
+
+    auto isInkPixel = [&](int x, int y) -> bool {
+        if (x < 0 || x >= source.width || y < 0 || y >= source.height) return false;
+        const uint8_t* p = source.pixels.data() + static_cast<size_t>(y) * source.stride + static_cast<size_t>(x) * 4;
+        int dR = isDark ? std::max(0, static_cast<int>(p[2]) - bg.r) : std::max(0, bg.r - static_cast<int>(p[2]));
+        int dG = isDark ? std::max(0, static_cast<int>(p[1]) - bg.g) : std::max(0, bg.g - static_cast<int>(p[1]));
+        int dB = isDark ? std::max(0, static_cast<int>(p[0]) - bg.b) : std::max(0, bg.b - static_cast<int>(p[0]));
+        return std::max({ dR, dG, dB }) >= 38;
+    };
+
+    auto colHasInk = [&](int x, int ry0, int ry1) -> bool {
+        int cnt = 0;
+        for (int y = ry0; y < ry1; ++y) {
+            if (isInkPixel(x, y) && ++cnt >= 2) return true;
+        }
+        return false;
+    };
+    auto rowHasInk = [&](int y, int rx0, int rx1) -> bool {
+        int cnt = 0;
+        for (int x = rx0; x < rx1; ++x) {
+            if (isInkPixel(x, y) && ++cnt >= 2) return true;
+        }
+        return false;
+    };
+
+    // Expand each edge outward while foreground ink touches its border (stops once a 2px clean margin is reached)
+    int padL = 0;
+    while (padL < maxPadPx && x0 > 0 && (colHasInk(x0, y0, y1) || colHasInk(std::min(x1 - 1, x0 + 1), y0, y1))) {
+        --x0; ++padL;
+    }
+    int padR = 0;
+    while (padR < maxPadPx && x1 < source.width && (colHasInk(x1 - 1, y0, y1) || colHasInk(std::max(x0, x1 - 2), y0, y1))) {
+        ++x1; ++padR;
+    }
+    int maxPadV = std::max(4, maxPadPx - 2);
+    int padT = 0;
+    while (padT < maxPadV && y0 > 0 && (rowHasInk(y0, x0, x1) || rowHasInk(std::min(y1 - 1, y0 + 1), x0, x1))) {
+        --y0; ++padT;
+    }
+    int padB = 0;
+    while (padB < maxPadV && y1 < source.height && (rowHasInk(y1 - 1, x0, x1) || rowHasInk(std::max(y0, y1 - 2), x0, x1))) {
+        ++y1; ++padB;
+    }
+
+    return RectF{
+        static_cast<float>(x0),
+        static_cast<float>(y0),
+        static_cast<float>(x1 - x0),
+        static_cast<float>(y1 - y0)
+    };
+}
+
 RawBitmap ScreenCapture::CropAndScale(const RawBitmap& source, const RectF& region, int upscaleFactor) {
     RawBitmap out;
     if (!source.valid()) return out;
@@ -90,7 +198,6 @@ RawBitmap ScreenCapture::CropAndScale(const RawBitmap& source, const RectF& regi
     if (cropW <= 2 || cropH <= 2) return out;
 
     upscaleFactor = std::clamp(upscaleFactor, 1, 3);
-    // Avoid upscaling if the region is already huge (> 2400px wide)
     if (cropW * upscaleFactor > 3840 || cropH * upscaleFactor > 2400) {
         upscaleFactor = 1;
     }
@@ -110,30 +217,76 @@ RawBitmap ScreenCapture::CropAndScale(const RawBitmap& source, const RectF& regi
             memcpy(dstRow, srcRow, static_cast<size_t>(cropW) * 4);
         }
     } else {
-        // Bilinear interpolation for smooth character edges during OCR
-        for (int dy = 0; dy < out.height; ++dy) {
-            float sy = (dy + 0.5f) / out.scaleFactor - 0.5f;
-            int iy = std::clamp(static_cast<int>(std::floor(sy)), 0, cropH - 1);
-            int iy1 = std::min(iy + 1, cropH - 1);
-            float fy = std::clamp(sy - iy, 0.0f, 1.0f);
+        // Separable 2-pass Catmull-Rom Bicubic upscaling (preserves crisp 1px punctuation & thin strokes)
+        std::vector<float> tmpH(static_cast<size_t>(cropH) * out.width * 3);
 
-            uint8_t* dstRow = out.pixels.data() + static_cast<size_t>(dy) * out.stride;
+        // Precompute horizontal 4-tap Catmull-Rom weights
+        struct Tap4 { int idx[4]; float w[4]; };
+        std::vector<Tap4> xTaps(static_cast<size_t>(out.width));
+        for (int dx = 0; dx < out.width; ++dx) {
+            float sx = (static_cast<float>(dx) + 0.5f) / out.scaleFactor - 0.5f;
+            int ix = static_cast<int>(std::floor(sx));
+            float fx = sx - static_cast<float>(ix);
+            float sumW = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                xTaps[dx].idx[k] = std::clamp(ix + k - 1, 0, cropW - 1);
+                float wk = BicubicWeight(fx - static_cast<float>(k - 1));
+                xTaps[dx].w[k] = wk;
+                sumW += wk;
+            }
+            if (std::fabs(sumW) > 1e-5f) {
+                for (int k = 0; k < 4; ++k) xTaps[dx].w[k] /= sumW;
+            }
+        }
+
+        // Pass 1: Horizontal bicubic
+        for (int sy = 0; sy < cropH; ++sy) {
+            const uint8_t* srcRow = source.pixels.data() + static_cast<size_t>(y0 + sy) * source.stride + static_cast<size_t>(x0) * 4;
+            float* dstRow = tmpH.data() + static_cast<size_t>(sy) * out.width * 3;
             for (int dx = 0; dx < out.width; ++dx) {
-                float sx = (dx + 0.5f) / out.scaleFactor - 0.5f;
-                int ix = std::clamp(static_cast<int>(std::floor(sx)), 0, cropW - 1);
-                int ix1 = std::min(ix + 1, cropW - 1);
-                float fx = std::clamp(sx - ix, 0.0f, 1.0f);
+                const auto& t = xTaps[dx];
+                float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const uint8_t* p = srcRow + static_cast<size_t>(t.idx[k]) * 4;
+                    float w = t.w[k];
+                    c0 += p[0] * w;
+                    c1 += p[1] * w;
+                    c2 += p[2] * w;
+                }
+                dstRow[dx * 3 + 0] = std::clamp(c0, 0.0f, 255.0f);
+                dstRow[dx * 3 + 1] = std::clamp(c1, 0.0f, 255.0f);
+                dstRow[dx * 3 + 2] = std::clamp(c2, 0.0f, 255.0f);
+            }
+        }
 
-                const uint8_t* p00 = source.pixels.data() + static_cast<size_t>(y0 + iy) * source.stride + static_cast<size_t>(x0 + ix) * 4;
-                const uint8_t* p10 = source.pixels.data() + static_cast<size_t>(y0 + iy) * source.stride + static_cast<size_t>(x0 + ix1) * 4;
-                const uint8_t* p01 = source.pixels.data() + static_cast<size_t>(y0 + iy1) * source.stride + static_cast<size_t>(x0 + ix) * 4;
-                const uint8_t* p11 = source.pixels.data() + static_cast<size_t>(y0 + iy1) * source.stride + static_cast<size_t>(x0 + ix1) * 4;
+        // Pass 2: Vertical bicubic into out.pixels
+        for (int dy = 0; dy < out.height; ++dy) {
+            float sy = (static_cast<float>(dy) + 0.5f) / out.scaleFactor - 0.5f;
+            int iy = static_cast<int>(std::floor(sy));
+            float fy = sy - static_cast<float>(iy);
+            int yIdx[4];
+            float yW[4];
+            float sumW = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                yIdx[k] = std::clamp(iy + k - 1, 0, cropH - 1);
+                yW[k] = BicubicWeight(fy - static_cast<float>(k - 1));
+                sumW += yW[k];
+            }
+            if (std::fabs(sumW) > 1e-5f) {
+                for (int k = 0; k < 4; ++k) yW[k] /= sumW;
+            }
 
+            const float* r0 = tmpH.data() + static_cast<size_t>(yIdx[0]) * out.width * 3;
+            const float* r1 = tmpH.data() + static_cast<size_t>(yIdx[1]) * out.width * 3;
+            const float* r2 = tmpH.data() + static_cast<size_t>(yIdx[2]) * out.width * 3;
+            const float* r3 = tmpH.data() + static_cast<size_t>(yIdx[3]) * out.width * 3;
+            uint8_t* dstRow = out.pixels.data() + static_cast<size_t>(dy) * out.stride;
+
+            for (int dx = 0; dx < out.width; ++dx) {
+                size_t o = static_cast<size_t>(dx) * 3;
                 for (int c = 0; c < 3; ++c) {
-                    float top = p00[c] * (1.0f - fx) + p10[c] * fx;
-                    float bot = p01[c] * (1.0f - fx) + p11[c] * fx;
-                    float val = top * (1.0f - fy) + bot * fy;
-                    dstRow[dx * 4 + c] = static_cast<uint8_t>(std::clamp(val + 0.5f, 0.0f, 255.0f));
+                    float v = r0[o + c] * yW[0] + r1[o + c] * yW[1] + r2[o + c] * yW[2] + r3[o + c] * yW[3];
+                    dstRow[dx * 4 + c] = static_cast<uint8_t>(std::clamp(v + 0.5f, 0.0f, 255.0f));
                 }
                 dstRow[dx * 4 + 3] = 255;
             }

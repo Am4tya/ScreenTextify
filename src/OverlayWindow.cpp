@@ -20,10 +20,11 @@ constexpr UINT_PTR TIMER_AUTOCLOSE_ID = 1002;
 enum HudButtonId {
     BTN_CODE_MODE     = 1,
     BTN_LINE_MODE     = 2,
-    BTN_COPY_ALL      = 3,
-    BTN_STITCH_APPEND = 4,
-    BTN_NEW_CROP      = 5,
-    BTN_CLOSE         = 6
+    BTN_STRIP_GUTTER  = 3,
+    BTN_COPY_ALL      = 4,
+    BTN_STITCH_APPEND = 5,
+    BTN_NEW_CROP      = 6,
+    BTN_CLOSE         = 7
 };
 } // namespace
 
@@ -180,24 +181,33 @@ void OverlayWindow::RunOcrOnRegion(const RectF& localRegion) {
 
     SetCursor(LoadCursor(nullptr, IDC_WAIT));
 
-    m_activeScanRegion = norm;
+    // Smart Edge Auto-Padding: if the user's crop box grazed ink on any edge, expand slightly
+    // (up to 10px) so clipped edge punctuation like ';', '{', '}' is never sliced off.
+    RectF smartRegion = ScreenCapture::SmartExpandCropRegion(m_frozenScreen, norm, 10);
+    m_activeScanRegion = smartRegion;
     m_ocrError.clear();
 
     int scale = 1;
     if (m_settings && m_settings->upscaleForOcr) {
-        if (norm.width < 320.0f && norm.height < 120.0f) {
+        if (smartRegion.width < 320.0f && smartRegion.height < 120.0f) {
             scale = 3;
-        } else if (norm.width < 1500.0f && norm.height < 950.0f) {
+        } else if (smartRegion.width < 1500.0f && smartRegion.height < 950.0f) {
             scale = 2;
         }
     }
 
-    RawBitmap cropped = ScreenCapture::CropAndScale(m_frozenScreen, norm, scale);
+    RawBitmap cropped = ScreenCapture::CropAndScale(m_frozenScreen, smartRegion, scale);
     m_ocrDoc = OcrService::RecognizeBitmap(cropped, &m_ocrError);
+    m_gutterWordCount = TextFormatter::MarkLineNumberGutter(m_ocrDoc);
+    m_uncertainWordCount = m_ocrDoc.uncertainWordCount();
 
+    size_t codeWords = m_ocrDoc.totalWords() - ((m_settings && m_settings->stripLineNumbers) ? m_gutterWordCount : 0);
     std::wstringstream msStream;
-    msStream << m_ocrDoc.totalWords() << L" words \x2022 "
-             << std::fixed << std::setprecision(0) << m_ocrDoc.recognitionTimeMs << L" ms";
+    msStream << codeWords << L"w \x2022 "
+             << std::fixed << std::setprecision(0) << m_ocrDoc.recognitionTimeMs << L"ms";
+    if (m_uncertainWordCount > 0 && (!m_settings || m_settings->showConfidenceHeatmap)) {
+        msStream << L" \x2022 \x26A0 " << m_uncertainWordCount;
+    }
     m_hudMetricsText = msStream.str();
 
     m_phase = OverlayPhase::InteractiveText;
@@ -216,7 +226,7 @@ void OverlayWindow::RunOcrOnRegion(const RectF& localRegion) {
 void OverlayWindow::UpdateHudLayout() {
     m_hudButtons.clear();
 
-    float barWidth = 832.0f;
+    float barWidth = 918.0f;
     float barHeight = 44.0f;
 
     float barX = m_activeScanRegion.centerX() - barWidth * 0.5f;
@@ -234,6 +244,7 @@ void OverlayWindow::UpdateHudLayout() {
 
     bool codeOn = m_settings ? m_settings->codeIndentationMode : true;
     bool lineOn = m_settings ? m_settings->lineSelectionMode : false;
+    bool gutterOn = m_settings ? m_settings->stripLineNumbers : true;
 
     struct BtnSpec {
         int id;
@@ -243,15 +254,16 @@ void OverlayWindow::UpdateHudLayout() {
     };
 
     std::vector<BtnSpec> specs = {
-        { BTN_CODE_MODE,     codeOn ? L"Code: ON (C)" : L"Code: OFF (C)", 120.0f, codeOn },
-        { BTN_LINE_MODE,     lineOn ? L"Lines (L)" : L"Words (L)", 98.0f, lineOn },
-        { BTN_COPY_ALL,      L"Copy All (Ctrl+A)", 130.0f, false },
-        { BTN_STITCH_APPEND, L"+ Stitch (A)", 108.0f, m_launchMode == CaptureLaunchMode::StitchAppend },
-        { BTN_NEW_CROP,      L"Re-Crop (R)", 98.0f, false },
-        { BTN_CLOSE,         L"Close (Esc)", 90.0f, false }
+        { BTN_CODE_MODE,     codeOn ? L"Code: ON (C)" : L"Code: OFF (C)", 114.0f, codeOn },
+        { BTN_LINE_MODE,     lineOn ? L"Lines (L)" : L"Words (L)", 88.0f, lineOn },
+        { BTN_STRIP_GUTTER,  gutterOn ? L"Gutter: Strip (G)" : L"Gutter: Keep (G)", 128.0f, gutterOn },
+        { BTN_COPY_ALL,      L"Copy All (Ctrl+A)", 124.0f, false },
+        { BTN_STITCH_APPEND, L"+ Stitch (A)", 98.0f, m_launchMode == CaptureLaunchMode::StitchAppend },
+        { BTN_NEW_CROP,      L"Re-Crop (R)", 92.0f, false },
+        { BTN_CLOSE,         L"Esc", 54.0f, false }
     };
 
-    float curX = barX + 146.0f; // Leave 136px on the left for the live OCR metrics pill
+    float curX = barX + 174.0f; // Leave 164px on the left for the live OCR metrics & warning pill
     for (const auto& s : specs) {
         HudButton btn;
         btn.id = s.id;
@@ -267,10 +279,15 @@ void OverlayWindow::UpdateSelectionFromDrag(const RectF& dragRect, bool additive
     RectF norm = dragRect.normalized();
     bool isClick = (norm.width < 4.0f && norm.height < 4.0f);
     bool lineMode = m_settings && m_settings->lineSelectionMode;
+    bool stripGutter = !m_settings || m_settings->stripLineNumbers;
 
     for (auto& line : m_ocrDoc.lines) {
         bool lineHit = isClick ? line.bounds.contains(norm.x, norm.y) : line.bounds.intersects(norm);
         for (auto& word : line.words) {
+            if (stripGutter && word.isLineNumber) {
+                if (!additive) word.selected = false;
+                continue;
+            }
             bool hit = lineMode ? lineHit
                                 : (isClick ? word.bounds.contains(norm.x, norm.y) : word.bounds.intersects(norm));
             if (hit) {
@@ -285,10 +302,11 @@ void OverlayWindow::UpdateSelectionFromDrag(const RectF& dragRect, bool additive
 void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected, bool stitchAppend) {
     if (m_ocrDoc.empty()) return;
 
+    bool stripGutter = !m_settings || m_settings->stripLineNumbers;
     bool anySelected = false;
     for (const auto& line : m_ocrDoc.lines) {
         for (const auto& word : line.words) {
-            if (word.selected) {
+            if (word.selected && !(stripGutter && word.isLineNumber)) {
                 anySelected = true;
                 break;
             }
@@ -303,15 +321,27 @@ void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected, bool stitch
     if (!anySelected && copyAllIfNoneSelected) {
         for (auto& line : m_ocrDoc.lines) {
             for (auto& word : line.words) {
-                word.selected = true;
+                word.selected = !(stripGutter && word.isLineNumber);
             }
         }
     }
 
     bool codeMode = m_settings ? m_settings->codeIndentationMode : true;
     size_t wordCount = 0;
-    std::wstring formatted = TextFormatter::FormatDocument(m_ocrDoc, true, codeMode, &wordCount);
+    std::wstring formatted = TextFormatter::FormatDocument(m_ocrDoc, true, codeMode, &wordCount, stripGutter);
     if (formatted.empty()) return;
+
+    // Collect unique uncertain words from the copied selection for Studio Dashboard highlighting
+    std::vector<std::wstring> uncertainWords;
+    for (const auto& line : m_ocrDoc.lines) {
+        for (const auto& word : line.words) {
+            if (word.selected && word.isUncertain() && !word.text.empty()) {
+                if (std::find(uncertainWords.begin(), uncertainWords.end(), word.text) == uncertainWords.end()) {
+                    uncertainWords.push_back(word.text);
+                }
+            }
+        }
+    }
 
     std::wstring finalOutput = formatted;
     std::wstring title;
@@ -322,7 +352,6 @@ void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected, bool stitch
         int appendedLines = 0;
         finalOutput = TextFormatter::StitchCodeBlocks(existing, formatted, &overlapLines, &appendedLines);
 
-        // Count total whitespace-delimited tokens in the stitched result
         std::wstringstream ws(finalOutput);
         std::wstring tok;
         size_t totalWords = 0;
@@ -336,13 +365,20 @@ void OverlayWindow::CopyCurrentSelection(bool copyAllIfNoneSelected, bool stitch
         title += L" \x2022 Clipboard Updated";
     } else {
         title = L"\x2713 Copied " + std::to_wstring(wordCount) +
-                (wordCount == 1 ? L" word to Clipboard " : L" words to Clipboard ") +
-                (codeMode ? L"\x2022 Code Indentation ON" : L"\x2022 Standard Text");
+                (wordCount == 1 ? L" word" : L" words");
+        if (stripGutter && m_gutterWordCount > 0) {
+            title += L" \x2022 Stripped " + std::to_wstring(m_gutterWordCount) + L" line #s";
+        }
+        if (!uncertainWords.empty()) {
+            title += L" \x2022 \x26A0 " + std::to_wstring(uncertainWords.size()) + L" uncertain";
+        } else {
+            title += codeMode ? L" \x2022 Code Mode" : L" \x2022 Standard Text";
+        }
     }
 
     if (CopyTextToClipboard(m_hwnd, finalOutput)) {
         if (m_onCopied) {
-            m_onCopied(finalOutput, codeMode, wordCount, m_ocrDoc.recognitionTimeMs);
+            m_onCopied(finalOutput, codeMode, wordCount, m_ocrDoc.recognitionTimeMs, uncertainWords);
         }
 
         ShowToast(title, stitchAppend ? formatted : finalOutput);
@@ -536,9 +572,15 @@ void OverlayWindow::OnPaint() {
         m_brush->SetColor(D2D1::ColorF(0.22f, 0.74f, 0.97f, 0.75f));
         m_renderTarget->DrawRectangle(srRect, m_brush, 1.6f);
 
-        // Draw Selectext interactive word boxes
+        // Draw Selectext interactive word boxes with Confidence Heatmap & Auto-Stripped Gutter styling
+        bool stripGutter = !m_settings || m_settings->stripLineNumbers;
+        bool showHeatmap = !m_settings || m_settings->showConfidenceHeatmap;
+        const OcrWordBox* hoveredWord = nullptr;
+
         for (const auto& line : m_ocrDoc.lines) {
             for (const auto& word : line.words) {
+                if (word.hovered) hoveredWord = &word;
+
                 D2D1_RECT_F wr = D2D1::RectF(
                     word.bounds.x - 2.0f,
                     word.bounds.y - 1.5f,
@@ -547,16 +589,42 @@ void OverlayWindow::OnPaint() {
                 );
                 D2D1_ROUNDED_RECT rrect = D2D1::RoundedRect(wr, 4.0f, 4.0f);
 
+                if (stripGutter && word.isLineNumber) {
+                    // Subtle muted badge showing the editor line-number gutter is auto-stripped
+                    m_brush->SetColor(D2D1::ColorF(0.06f, 0.08f, 0.13f, 0.28f));
+                    m_renderTarget->FillRoundedRectangle(rrect, m_brush);
+                    m_brush->SetColor(D2D1::ColorF(0.45f, 0.53f, 0.65f, 0.48f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.0f);
+                    continue;
+                }
+
+                bool uncertain = showHeatmap && word.isUncertain();
+                bool veryLow = showHeatmap && word.isVeryLowConfidence();
+                D2D1_COLOR_F warnCol = veryLow
+                    ? D2D1::ColorF(0.976f, 0.451f, 0.086f, 1.0f)   // #F97316 Orange-Amber (high risk)
+                    : UiTheme::AccentAmber;                        // #FBBF24 Warm Amber (uncertain)
+
                 if (word.selected) {
-                    m_brush->SetColor(D2D1::ColorF(0.14f, 0.48f, 0.98f, 0.48f));
+                    m_brush->SetColor(uncertain
+                        ? D2D1::ColorF(0.16f, 0.46f, 0.92f, 0.42f)
+                        : D2D1::ColorF(0.14f, 0.48f, 0.98f, 0.48f));
                     m_renderTarget->FillRoundedRectangle(rrect, m_brush);
-                    m_brush->SetColor(D2D1::ColorF(0.42f, 0.78f, 1.0f, 1.0f));
-                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.7f);
+                    m_brush->SetColor(uncertain ? warnCol : D2D1::ColorF(0.42f, 0.78f, 1.0f, 1.0f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, uncertain ? 1.9f : 1.7f);
                 } else if (word.hovered) {
-                    m_brush->SetColor(D2D1::ColorF(0.08f, 0.65f, 0.92f, 0.36f));
+                    m_brush->SetColor(uncertain
+                        ? UiTheme::WithAlpha(warnCol, 0.34f)
+                        : D2D1::ColorF(0.08f, 0.65f, 0.92f, 0.36f));
                     m_renderTarget->FillRoundedRectangle(rrect, m_brush);
-                    m_brush->SetColor(D2D1::ColorF(0.28f, 0.82f, 1.0f, 0.95f));
-                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.5f);
+                    m_brush->SetColor(uncertain ? warnCol : D2D1::ColorF(0.28f, 0.82f, 1.0f, 0.95f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.65f);
+                } else if (uncertain) {
+                    // Amber Confidence Heatmap warning box + crisp bottom warning accent bar
+                    m_brush->SetColor(UiTheme::WithAlpha(warnCol, veryLow ? 0.28f : 0.20f));
+                    m_renderTarget->FillRoundedRectangle(rrect, m_brush);
+                    m_brush->SetColor(UiTheme::WithAlpha(warnCol, 0.92f));
+                    m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.4f);
+                    m_renderTarget->DrawLine({ wr.left + 3.0f, wr.bottom - 0.5f }, { wr.right - 3.0f, wr.bottom - 0.5f }, m_brush, 2.0f);
                 } else {
                     m_brush->SetColor(D2D1::ColorF(0.06f, 0.12f, 0.25f, 0.28f));
                     m_renderTarget->FillRoundedRectangle(rrect, m_brush);
@@ -564,6 +632,40 @@ void OverlayWindow::OnPaint() {
                     m_renderTarget->DrawRoundedRectangle(rrect, m_brush, 1.0f);
                 }
             }
+        }
+
+        // Floating Hover Confidence Tooltip Pill directly above hovered word (shows recognized text + %)
+        if (hoveredWord && !m_isDragging && m_hudTextFormat) {
+            int confPct = std::clamp(static_cast<int>(std::round(hoveredWord->minCharConf * 100.0f)), 0, 100);
+            std::wstring tipText;
+            D2D1_COLOR_F tipAccent = UiTheme::AccentEmerald;
+            if (stripGutter && hoveredWord->isLineNumber) {
+                tipText = L"Line #" + hoveredWord->text + L" (auto-stripped)";
+                tipAccent = UiTheme::TextSecondary;
+            } else if (hoveredWord->isUncertain()) {
+                tipText = L"\x26A0 \"" + hoveredWord->text + L"\"  \x2022  " + std::to_wstring(confPct) + L"%";
+                tipAccent = hoveredWord->isVeryLowConfidence()
+                    ? D2D1::ColorF(0.976f, 0.451f, 0.086f, 1.0f)
+                    : UiTheme::AccentAmber;
+            } else {
+                tipText = L"\"" + hoveredWord->text + L"\"  \x2022  " + std::to_wstring(confPct) + L"%";
+                tipAccent = UiTheme::AccentEmerald;
+            }
+
+            float tipW = std::clamp(static_cast<float>(tipText.size()) * 7.6f + 26.0f, 110.0f, 380.0f);
+            float tipH = 26.0f;
+            float tipX = std::clamp(hoveredWord->bounds.centerX() - tipW * 0.5f, 8.0f, std::max(8.0f, fullW - tipW - 8.0f));
+            float tipY = hoveredWord->bounds.y - tipH - 7.0f;
+            if (tipY < 8.0f) tipY = hoveredWord->bounds.bottom() + 7.0f;
+
+            D2D1_RECT_F tipRect = D2D1::RectF(tipX, tipY, tipX + tipW, tipY + tipH);
+            UiTheme::DrawSoftShadow(m_renderTarget, m_brush, tipRect, 6.0f, 0.8f);
+            m_brush->SetColor(D2D1::ColorF(0.043f, 0.063f, 0.105f, 0.96f));
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(tipRect, 6.0f, 6.0f), m_brush);
+            m_brush->SetColor(UiTheme::WithAlpha(tipAccent, 0.90f));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(tipRect, 6.0f, 6.0f), m_brush, 1.25f);
+            m_brush->SetColor(tipAccent);
+            m_renderTarget->DrawTextW(tipText.c_str(), static_cast<UINT32>(tipText.length()), m_hudTextFormat, tipRect, m_brush);
         }
 
         if (m_isDragging) {
@@ -598,13 +700,14 @@ void OverlayWindow::OnPaint() {
         m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentPrimary, 0.48f));
         m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(hudRect, 11.0f, 11.0f), m_brush, 1.25f);
 
-        // Metrics pill on left of HUD
-        D2D1_RECT_F metricsRect = D2D1::RectF(m_hudBarRect.x + 8.0f, m_hudBarRect.y + 6.0f, m_hudBarRect.x + 140.0f, m_hudBarRect.bottom() - 6.0f);
-        m_brush->SetColor(UiTheme::BgCanvas);
+        // Metrics pill on left of HUD (turns warm Amber if uncertain words are flagged)
+        D2D1_RECT_F metricsRect = D2D1::RectF(m_hudBarRect.x + 8.0f, m_hudBarRect.y + 6.0f, m_hudBarRect.x + 168.0f, m_hudBarRect.bottom() - 6.0f);
+        bool hasUncertain = (m_uncertainWordCount > 0 && (!m_settings || m_settings->showConfidenceHeatmap));
+        m_brush->SetColor(hasUncertain ? D2D1::ColorF(0.14f, 0.10f, 0.04f, 0.95f) : UiTheme::BgCanvas);
         m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(metricsRect, 7.0f, 7.0f), m_brush);
-        m_brush->SetColor(UiTheme::BorderSubtle);
+        m_brush->SetColor(hasUncertain ? UiTheme::WithAlpha(UiTheme::AccentAmber, 0.70f) : UiTheme::BorderSubtle);
         m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(metricsRect, 7.0f, 7.0f), m_brush, 1.0f);
-        m_brush->SetColor(UiTheme::AccentPrimary);
+        m_brush->SetColor(hasUncertain ? UiTheme::AccentAmber : UiTheme::AccentPrimary);
         if (m_hudTextFormat) {
             m_renderTarget->DrawTextW(m_hudMetricsText.c_str(), static_cast<UINT32>(m_hudMetricsText.length()), m_hudTextFormat, metricsRect, m_brush);
         }
@@ -744,6 +847,15 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                             AppStorage::SaveSettings(*m_settings);
                         }
                         UpdateHudLayout();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        break;
+                    case BTN_STRIP_GUTTER:
+                        if (m_settings) {
+                            m_settings->stripLineNumbers = !m_settings->stripLineNumbers;
+                            AppStorage::SaveSettings(*m_settings);
+                        }
+                        UpdateHudLayout();
+                        CopyCurrentSelection(false);
                         InvalidateRect(hwnd, nullptr, FALSE);
                         break;
                     case BTN_COPY_ALL:
@@ -903,6 +1015,24 @@ LRESULT OverlayWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     AppStorage::SaveSettings(*m_settings);
                 }
                 UpdateHudLayout();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!ctrlDown && wParam == 'G') {
+                if (m_settings) {
+                    m_settings->stripLineNumbers = !m_settings->stripLineNumbers;
+                    AppStorage::SaveSettings(*m_settings);
+                }
+                UpdateHudLayout();
+                CopyCurrentSelection(false, false);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (!ctrlDown && wParam == 'H') {
+                if (m_settings) {
+                    m_settings->showConfidenceHeatmap = !m_settings->showConfidenceHeatmap;
+                    AppStorage::SaveSettings(*m_settings);
+                }
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }

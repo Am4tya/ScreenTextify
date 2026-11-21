@@ -149,9 +149,9 @@ public:
         m_overlay = std::make_unique<OverlayWindow>(
             m_hInstance,
             &m_settings,
-            [this](const std::wstring& text, bool codeMode, size_t wordCount, double ocrTimeMs) {
+            [this](const std::wstring& text, bool codeMode, size_t wordCount, double ocrTimeMs, const std::vector<std::wstring>& uncertainWords) {
                 if (m_historyWnd) {
-                    m_historyWnd->AddHistoryEntry(text, codeMode, wordCount, ocrTimeMs);
+                    m_historyWnd->AddHistoryEntry(text, codeMode, wordCount, ocrTimeMs, uncertainWords);
                 }
             }
         );
@@ -537,6 +537,132 @@ RawBitmap RenderCodeSnippet(const std::vector<std::wstring>& lines, const wchar_
     return result;
 }
 
+RawBitmap RenderHardTortureFrame(
+    const std::vector<std::wstring>& lines,
+    const wchar_t* fontName,
+    int fontSize,
+    bool dimCommentLines,
+    bool drawRedSquiggleAndCursor,
+    int* outTightRightX = nullptr
+) {
+    int width = 760;
+    int height = std::max(140, static_cast<int>(lines.size()) * 26 + 44);
+    RawBitmap result;
+
+    HDC hScreenDC = GetDC(nullptr);
+    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = nullptr;
+    HBITMAP hDib = CreateDIBSection(hScreenDC, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    HGDIOBJ hOldBmp = SelectObject(hMemDC, hDib);
+
+    RECT rc = { 0, 0, width, height };
+    HBRUSH hBg = CreateSolidBrush(RGB(22, 24, 30));
+    FillRect(hMemDC, &rc, hBg);
+    DeleteObject(hBg);
+
+    HFONT hFont = CreateFontW(
+        fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, fontName
+    );
+    HGDIOBJ hOldFont = SelectObject(hMemDC, hFont);
+    SetBkMode(hMemDC, TRANSPARENT);
+
+    COLORREF paletteDark[] = { RGB(156, 220, 254), RGB(206, 145, 120), RGB(197, 134, 192), RGB(220, 220, 170), RGB(86, 156, 214) };
+    int maxRightX = 0;
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        int curX = 24;
+        int curY = 18 + static_cast<int>(i) * 26;
+        const std::wstring& ln = lines[i];
+
+        std::wstring trimmed = ln;
+        size_t s = 0;
+        while (s < trimmed.size() && trimmed[s] == L' ') ++s;
+        bool isComment = dimCommentLines && (s + 1 < trimmed.size() && trimmed[s] == L'/' && trimmed[s + 1] == L'/');
+
+        if (isComment) {
+            // Very dim VS Code comment gray (#383C46 on #16181E -> delta ~28..42, falls under standard mask after YouTube blur!)
+            SetTextColor(hMemDC, RGB(58, 62, 72));
+            TextOutW(hMemDC, curX, curY, ln.c_str(), static_cast<int>(ln.size()));
+            SIZE sz = {};
+            GetTextExtentPoint32W(hMemDC, ln.c_str(), static_cast<int>(ln.size()), &sz);
+            maxRightX = std::max<int>(maxRightX, curX + static_cast<int>(sz.cx));
+        } else {
+            size_t pos = 0;
+            int colorIdx = static_cast<int>(i);
+            while (pos < ln.size()) {
+                size_t next = pos + 1;
+                if (std::iswspace(ln[pos])) {
+                    while (next < ln.size() && std::iswspace(ln[next])) ++next;
+                } else if (std::iswalnum(ln[pos]) || ln[pos] == L'_') {
+                    while (next < ln.size() && (std::iswalnum(ln[next]) || ln[next] == L'_')) ++next;
+                }
+                std::wstring chunk = ln.substr(pos, next - pos);
+                SetTextColor(hMemDC, paletteDark[colorIdx % 5]);
+                TextOutW(hMemDC, curX, curY, chunk.c_str(), static_cast<int>(chunk.size()));
+                SIZE sz = {};
+                GetTextExtentPoint32W(hMemDC, chunk.c_str(), static_cast<int>(chunk.size()), &sz);
+
+                // Draw realistic red wavy ESLint squiggle beneath a token on line 1
+                if (drawRedSquiggleAndCursor && i == 1 && chunk.size() >= 6) {
+                    HPEN redPen = CreatePen(PS_SOLID, 1, RGB(241, 76, 76));
+                    HGDIOBJ oldPen = SelectObject(hMemDC, redPen);
+                    int sqY = curY + 16;
+                    for (int wx = curX; wx + 2 <= curX + sz.cx; wx += 4) {
+                        MoveToEx(hMemDC, wx, sqY, nullptr);
+                        LineTo(hMemDC, wx + 2, sqY + 2);
+                        LineTo(hMemDC, std::min<int>(curX + static_cast<int>(sz.cx), wx + 4), sqY);
+                    }
+                    SelectObject(hMemDC, oldPen);
+                    DeleteObject(redPen);
+                }
+
+                curX += sz.cx;
+                pos = next;
+                if (!std::iswspace(chunk[0])) ++colorIdx;
+            }
+            maxRightX = std::max(maxRightX, curX);
+
+            // Draw a tall blinking VS Code cursor caret ('|') at end of line 2
+            if (drawRedSquiggleAndCursor && i == 2) {
+                HPEN caretPen = CreatePen(PS_SOLID, 1, RGB(230, 236, 245));
+                HGDIOBJ oldPen = SelectObject(hMemDC, caretPen);
+                MoveToEx(hMemDC, curX + 2, curY - 3, nullptr);
+                LineTo(hMemDC, curX + 2, curY + 19);
+                SelectObject(hMemDC, oldPen);
+                DeleteObject(caretPen);
+            }
+        }
+    }
+
+    if (outTightRightX) *outTightRightX = maxRightX;
+
+    GdiFlush();
+    result.width = width;
+    result.height = height;
+    result.stride = width * 4;
+    result.pixels.resize(static_cast<size_t>(width) * height * 4);
+    memcpy(result.pixels.data(), pBits, result.pixels.size());
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) result.pixels[i * 4 + 3] = 255;
+
+    SelectObject(hMemDC, hOldFont);
+    DeleteObject(hFont);
+    SelectObject(hMemDC, hOldBmp);
+    DeleteObject(hDib);
+    DeleteDC(hMemDC);
+    ReleaseDC(nullptr, hScreenDC);
+    return result;
+}
+
 int RunBenchmark() {
     AttachParentConsole();
     PaddleOcr::EnsureInitialized();
@@ -631,6 +757,86 @@ int RunBenchmark() {
         report << L"==> TOTAL [" << modelOpt << L"]: " << std::fixed << std::setprecision(2) << overallAcc
                << L"% character accuracy (" << totalEdits << L" edits / " << totalChars << L" chars, "
                << totalMs << L" ms total)\r\n";
+    }
+
+    // Section 2: Hard Torture Suite (Dimmed Comments + Red Squiggles + Blinking Cursor + Tight Edge Crop)
+    report << L"\r\n=== Ultra-Precision Rescue Torture Suite (YouTube YUV420 Degraded) ===\r\n";
+    {
+        PaddleOcr::Options opts;
+        opts.model = L"ensemble";
+        opts.constrainToCodeAscii = true;
+        opts.dualViewVerify = true;
+        PaddleOcr::SetOptions(opts);
+
+        struct TortureCase {
+            const wchar_t* name;
+            bool dimComments;
+            bool squiggleAndCursor;
+            bool tightCrop;
+            std::vector<std::wstring> lines;
+        };
+
+        std::vector<TortureCase> hardSuite = {
+            { L"Dimmed VS Code Comments (#3A3E48 on #16181E) + Code", true, false, false, {
+                L"// Validate incoming session token",
+                L"export function verifySession(token) {",
+                L"  // Reject short or empty payloads",
+                L"  if (!token || token.length < 16) return false;",
+                L"  return token.startsWith(\"stk_\");",
+                L"}"
+            }},
+            { L"Red Wavy ESLint Squiggle + Tall Blinking Cursor Caret", false, true, false, {
+                L"function computeTotal(prices) {",
+                L"  const subtotal = prices.reduce((a, b) => a + b, 0);",
+                L"  const finalPrice = subtotal * 1.08;",
+                L"  return Math.round(finalPrice);",
+                L"}"
+            }},
+            { L"Tight-Cropped Edge Recovery (2px inside right border)", false, false, true, {
+                L"const config = {",
+                L"  retries: 3,",
+                L"  timeoutMs: 5000,",
+                L"};"
+            }}
+        };
+
+        size_t hardChars = 0, hardEdits = 0;
+        for (const auto& hc : hardSuite) {
+            int tightRightX = 0;
+            RawBitmap raw = RenderHardTortureFrame(hc.lines, L"Consolas", -15, hc.dimComments, hc.squiggleAndCursor, &tightRightX);
+            RawBitmap degraded = DegradeLikeYouTubeVideo(raw);
+
+            RectF cropRect = { 0.0f, 0.0f, static_cast<float>(degraded.width), static_cast<float>(degraded.height) };
+            if (hc.tightCrop && tightRightX > 40) {
+                // Intentionally crop 2px inside the rightmost glyph edge to test SmartExpandCropRegion
+                cropRect = { 25.0f, 19.0f, static_cast<float>(tightRightX - 27), static_cast<float>(degraded.height - 30) };
+                cropRect = ScreenCapture::SmartExpandCropRegion(degraded, cropRect, 10);
+            }
+            RawBitmap scaled = ScreenCapture::CropAndScale(degraded, cropRect, 2);
+
+            std::wstring err;
+            OcrDocument doc = OcrService::RecognizeBitmap(scaled, &err);
+            std::wstring got = TextFormatter::FormatDocument(doc, false, true, nullptr);
+
+            std::wstring expected;
+            for (size_t i = 0; i < hc.lines.size(); ++i) {
+                if (i > 0) expected += L"\r\n";
+                expected += hc.lines[i];
+            }
+
+            size_t dist = LevenshteinDistance(expected, got);
+            hardChars += expected.size();
+            hardEdits += dist;
+            double acc = 100.0 * (1.0 - static_cast<double>(dist) / std::max<size_t>(1, expected.size()));
+            report << L"  * " << hc.name << L": " << std::fixed << std::setprecision(2) << acc
+                   << L"% (" << dist << L" edits / " << expected.size() << L" chars, " << doc.recognitionTimeMs << L" ms)\r\n";
+            if (dist > 0) {
+                report << L"    [GOT]:\r\n" << got << L"\r\n";
+            }
+        }
+        double hardAcc = 100.0 * (1.0 - static_cast<double>(hardEdits) / std::max<size_t>(1, hardChars));
+        report << L"==> TOTAL [Torture Suite]: " << std::fixed << std::setprecision(2) << hardAcc
+               << L"% character accuracy (" << hardEdits << L" edits / " << hardChars << L" chars)\r\n";
     }
 
     WriteStdout(report.str());
@@ -760,6 +966,89 @@ int RunSelfTest(HINSTANCE hInstance) {
         }
         report << L"11. Multi-Frame Stitch & Append Deduplication: OK (merged " << overlap
                << L" overlapping lines, appended " << appended << L" new lines)\r\n";
+    }
+
+    // 12. Verify Auto Line-Number Gutter Stripping on a synthetic VS Code frame with gutter numbers 41..47
+    {
+        std::vector<std::wstring> gutterLines = {
+            L"41    export function computeSum(nums) {",
+            L"42      let total = 0;",
+            L"43      for (const n of nums) {",
+            L"44        total += n;",
+            L"45      }",
+            L"46      return total;",
+            L"47    }"
+        };
+        RawBitmap gutterFrame = RenderCodeSnippet(gutterLines, L"Consolas", -15, false);
+        RawBitmap gutterScaled = ScreenCapture::CropAndScale(
+            gutterFrame, { 0.0f, 0.0f, static_cast<float>(gutterFrame.width), static_cast<float>(gutterFrame.height) }, 2
+        );
+        OcrDocument gDoc = OcrService::RecognizeBitmap(gutterScaled, &err);
+        size_t markedGutter = TextFormatter::MarkLineNumberGutter(gDoc);
+        size_t gWords = 0;
+        std::wstring stripped = TextFormatter::FormatDocument(gDoc, false, true, &gWords, true);
+        if (markedGutter < 6 || stripped.find(L"41") != std::wstring::npos || stripped.find(L"46") != std::wstring::npos ||
+            stripped.find(L"export function computeSum(nums)") == std::wstring::npos) {
+            report << L"FAILED: Line-number gutter stripping failed (marked=" << markedGutter << L"):\r\n" << stripped << L"\r\n";
+            std::wcerr << report.str();
+            CoUninitialize();
+            return 1;
+        }
+        report << L"12. Auto Line-Number Gutter Stripping: OK (stripped " << markedGutter
+               << L" gutter numbers, " << gDoc.recognitionTimeMs << L" ms)\r\n";
+    }
+
+    // 13. Verify Per-Word Confidence Scores & Confidence Heatmap Calibration
+    {
+        size_t validConfWords = 0;
+        float minSeen = 1.0f, maxSeen = 0.0f;
+        for (const auto& l : doc.lines) {
+            for (const auto& w : l.words) {
+                if (w.confidence >= 0.0f && w.confidence <= 1.0f && w.minCharConf >= 0.0f && w.minCharConf <= 1.0f) {
+                    ++validConfWords;
+                    minSeen = std::min(minSeen, w.minCharConf);
+                    maxSeen = std::max(maxSeen, w.confidence);
+                }
+            }
+        }
+        if (validConfWords != doc.totalWords() || maxSeen < 0.80f) {
+            report << L"FAILED: Per-word confidence metadata invalid (" << validConfWords << L"/" << doc.totalWords() << L")\r\n";
+            std::wcerr << report.str();
+            CoUninitialize();
+            return 1;
+        }
+        report << L"13. Confidence Heatmap Metadata: OK (" << validConfWords << L" words scored, range ["
+               << std::fixed << std::setprecision(2) << minSeen << L".." << maxSeen
+               << L"], uncertain=" << doc.uncertainWordCount() << L")\r\n";
+    }
+
+    // 14. Verify Cross-Line Identifier Voting (repairs uncertain smudges while protecting digits/plurals)
+    {
+        OcrDocument voteDoc;
+        OcrLineBox l1;
+        l1.words.push_back({ L"countries", { 10, 10, 80, 18 }, 0, 0, 0.99f, 0.97f, false, false, false });
+        l1.words.push_back({ L"node1",     { 100, 10, 50, 18 }, 0, 1, 0.99f, 0.98f, false, false, false });
+        l1.words.push_back({ L"item",      { 160, 10, 40, 18 }, 0, 2, 0.99f, 0.98f, false, false, false });
+        OcrLineBox l2;
+        l2.words.push_back({ L"'../../utils/countriles';", { 10, 34, 180, 18 }, 1, 0, 0.78f, 0.62f, false, false, false });
+        l2.words.push_back({ L"node2",                     { 200, 34, 50, 18 }, 1, 1, 0.79f, 0.65f, false, false, false });
+        l2.words.push_back({ L"items",                     { 260, 34, 48, 18 }, 1, 2, 0.79f, 0.65f, false, false, false });
+        voteDoc.lines.push_back(std::move(l1));
+        voteDoc.lines.push_back(std::move(l2));
+
+        size_t fixed = PaddleOcr::RepairCrossLineIdentifiers(voteDoc);
+        if (fixed != 1 ||
+            voteDoc.lines[1].words[0].text != L"'../../utils/countries';" ||
+            voteDoc.lines[1].words[1].text != L"node2" ||
+            voteDoc.lines[1].words[2].text != L"items") {
+            report << L"FAILED: Cross-Line Identifier Voting mismatch (fixed=" << fixed << L", got="
+                   << voteDoc.lines[1].words[0].text << L" / " << voteDoc.lines[1].words[1].text
+                   << L" / " << voteDoc.lines[1].words[2].text << L")\r\n";
+            std::wcerr << report.str();
+            CoUninitialize();
+            return 1;
+        }
+        report << L"14. Cross-Line Identifier Voting: OK (repaired 'countriles' -> 'countries', preserved 'node2' & 'items')\r\n";
     }
 
     report << L"=== ALL GUI & OCR SELF-TESTS PASSED ===\r\n";

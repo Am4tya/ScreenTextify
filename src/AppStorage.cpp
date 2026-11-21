@@ -84,6 +84,8 @@ bool AppStorage::LoadSettings(AppSettings& settings) {
         else if (key == "autoCopyOnRelease") settings.autoCopyOnRelease = bval;
         else if (key == "autoCloseAfterCopy") settings.autoCloseAfterCopy = bval;
         else if (key == "upscaleForOcr") settings.upscaleForOcr = bval;
+        else if (key == "stripLineNumbers") settings.stripLineNumbers = bval;
+        else if (key == "showConfidenceHeatmap") settings.showConfidenceHeatmap = bval;
         else if (key == "showLivePreviewCard") settings.showLivePreviewCard = bval;
     }
     return true;
@@ -99,6 +101,8 @@ bool AppStorage::SaveSettings(const AppSettings& settings) {
     out << "autoCopyOnRelease=" << (settings.autoCopyOnRelease ? 1 : 0) << "\n";
     out << "autoCloseAfterCopy=" << (settings.autoCloseAfterCopy ? 1 : 0) << "\n";
     out << "upscaleForOcr=" << (settings.upscaleForOcr ? 1 : 0) << "\n";
+    out << "stripLineNumbers=" << (settings.stripLineNumbers ? 1 : 0) << "\n";
+    out << "showConfidenceHeatmap=" << (settings.showConfidenceHeatmap ? 1 : 0) << "\n";
     out << "showLivePreviewCard=" << (settings.showLivePreviewCard ? 1 : 0) << "\n";
     out << "startWithWindows=" << (settings.startWithWindows ? 1 : 0) << "\n";
     return out.good();
@@ -112,7 +116,12 @@ bool AppStorage::LoadHistory(std::vector<CaptureHistoryItem>& history) {
 
     char magic[4] = {};
     in.read(magic, 4);
-    if (!in || magic[0] != 'S' || magic[1] != 'T' || magic[2] != 'H' || magic[3] != '1') {
+    int version = 0;
+    if (in && magic[0] == 'S' && magic[1] == 'T' && magic[2] == 'H' && magic[3] == '1') {
+        version = 1;
+    } else if (in && magic[0] == 'S' && magic[1] == 'T' && magic[2] == 'H' && magic[3] == '2') {
+        version = 2;
+    } else {
         return false;
     }
 
@@ -145,6 +154,22 @@ bool AppStorage::LoadHistory(std::vector<CaptureHistoryItem>& history) {
         item.wasCodeMode = (wasCode != 0);
         item.wordCount = static_cast<size_t>(wc);
         item.ocrTimeMs = ms;
+
+        if (version >= 2) {
+            uint32_t uncCount = 0;
+            in.read(reinterpret_cast<char*>(&uncCount), sizeof(uncCount));
+            if (!in || uncCount > 256) break;
+            for (uint32_t u = 0; u < uncCount; ++u) {
+                uint32_t uLen = 0;
+                in.read(reinterpret_cast<char*>(&uLen), sizeof(uLen));
+                if (!in || uLen > 512) break;
+                std::string uUtf8(uLen, '\0');
+                if (uLen > 0) in.read(uUtf8.data(), static_cast<std::streamsize>(uLen));
+                if (!in) break;
+                item.uncertainWords.push_back(Utf8ToWide(uUtf8));
+            }
+        }
+
         history.push_back(std::move(item));
     }
 
@@ -156,7 +181,7 @@ bool AppStorage::SaveHistory(const std::vector<CaptureHistoryItem>& history) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return false;
 
-    const char magic[4] = { 'S', 'T', 'H', '1' };
+    const char magic[4] = { 'S', 'T', 'H', '2' };
     out.write(magic, 4);
 
     uint32_t count = static_cast<uint32_t>(std::min<size_t>(history.size(), 30));
@@ -179,6 +204,15 @@ bool AppStorage::SaveHistory(const std::vector<CaptureHistoryItem>& history) {
         out.write(reinterpret_cast<const char*>(&ms), sizeof(ms));
         if (tsLen > 0) out.write(tsUtf8.data(), static_cast<std::streamsize>(tsLen));
         if (textLen > 0) out.write(textUtf8.data(), static_cast<std::streamsize>(textLen));
+
+        uint32_t uncCount = static_cast<uint32_t>(std::min<size_t>(item.uncertainWords.size(), 64));
+        out.write(reinterpret_cast<const char*>(&uncCount), sizeof(uncCount));
+        for (uint32_t u = 0; u < uncCount; ++u) {
+            std::string uUtf8 = WideToUtf8(item.uncertainWords[u]);
+            uint32_t uLen = static_cast<uint32_t>(uUtf8.size());
+            out.write(reinterpret_cast<const char*>(&uLen), sizeof(uLen));
+            if (uLen > 0) out.write(uUtf8.data(), static_cast<std::streamsize>(uLen));
+        }
     }
     return out.good();
 }

@@ -38,6 +38,8 @@ enum ActionId {
     ACT_TOGGLE_UPSCALE   = 204,
     ACT_TOGGLE_AUTOCLOSE = 205,
     ACT_TOGGLE_STARTWIN  = 206,
+    ACT_TOGGLE_GUTTER    = 207,
+    ACT_TOGGLE_HEATMAP   = 208,
 
     ACT_BTN_COPY_CODE   = 301,
     ACT_BTN_SAVE_FILE   = 302,
@@ -178,6 +180,8 @@ bool HistoryWindow::Initialize() {
         m_toggleAnim[3] = m_settings->upscaleForOcr ? 1.0f : 0.0f;
         m_toggleAnim[4] = m_settings->autoCloseAfterCopy ? 1.0f : 0.0f;
         m_toggleAnim[5] = m_settings->startWithWindows ? 1.0f : 0.0f;
+        m_toggleAnim[6] = m_settings->stripLineNumbers ? 1.0f : 0.0f;
+        m_toggleAnim[7] = m_settings->showConfidenceHeatmap ? 1.0f : 0.0f;
     }
 
     if (!AppStorage::LoadHistory(m_history) || m_history.empty()) {
@@ -238,15 +242,17 @@ void HistoryWindow::StepAnimations() {
 
     // 3. Toggle switch springs
     if (m_settings) {
-        const bool vals[6] = {
+        const bool vals[8] = {
             m_settings->codeIndentationMode,
             m_settings->lineSelectionMode,
             m_settings->autoCopyOnRelease,
             m_settings->upscaleForOcr,
             m_settings->autoCloseAfterCopy,
-            m_settings->startWithWindows
+            m_settings->startWithWindows,
+            m_settings->stripLineNumbers,
+            m_settings->showConfidenceHeatmap
         };
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 8; ++i) {
             if (UiTheme::Approach(m_toggleAnim[i], vals[i] ? 1.0f : 0.0f, 20.0f, dt)) animating = true;
         }
     }
@@ -326,7 +332,13 @@ void HistoryWindow::ShowAndFocus() {
     InvalidateRect(m_hwnd, nullptr, FALSE);
 }
 
-void HistoryWindow::AddHistoryEntry(const std::wstring& text, bool codeMode, size_t wordCount, double ocrTimeMs) {
+void HistoryWindow::AddHistoryEntry(
+    const std::wstring& text,
+    bool codeMode,
+    size_t wordCount,
+    double ocrTimeMs,
+    const std::vector<std::wstring>& uncertainWords
+) {
     std::time_t now = std::time(nullptr);
     std::tm localTm = {};
     localtime_s(&localTm, &now);
@@ -339,6 +351,7 @@ void HistoryWindow::AddHistoryEntry(const std::wstring& text, bool codeMode, siz
     item.wasCodeMode = codeMode;
     item.wordCount = wordCount;
     item.ocrTimeMs = ocrTimeMs;
+    item.uncertainWords = uncertainWords;
 
     m_history.insert(m_history.begin(), item);
     if (m_history.size() > 30) {
@@ -376,13 +389,32 @@ void HistoryWindow::RunOcrOnBitmap(const RawBitmap& bmp, const std::wstring& sou
     std::wstring err;
     OcrDocument doc = OcrService::RecognizeBitmap(scaled, &err);
     if (!doc.empty()) {
-        size_t wc = 0;
         bool codeOn = m_settings ? m_settings->codeIndentationMode : true;
-        std::wstring formatted = TextFormatter::FormatDocument(doc, false, codeOn, &wc);
+        bool stripGutter = !m_settings || m_settings->stripLineNumbers;
+        size_t gutterStripped = TextFormatter::MarkLineNumberGutter(doc);
+
+        std::vector<std::wstring> uncertainWords;
+        for (const auto& line : doc.lines) {
+            for (const auto& w : line.words) {
+                if (w.isUncertain() && !w.text.empty()) {
+                    if (std::find(uncertainWords.begin(), uncertainWords.end(), w.text) == uncertainWords.end()) {
+                        uncertainWords.push_back(w.text);
+                    }
+                }
+            }
+        }
+
+        size_t wc = 0;
+        std::wstring formatted = TextFormatter::FormatDocument(doc, false, codeOn, &wc, stripGutter);
         OverlayWindow::CopyTextToClipboard(m_hwnd, formatted);
-        AddHistoryEntry(formatted, codeOn, wc, doc.recognitionTimeMs);
-        ShowToast(L"Copied " + std::to_wstring(wc) + L" words from " + sourceLabel + L" (" +
-                  std::to_wstring(static_cast<int>(doc.recognitionTimeMs)) + L" ms)");
+        AddHistoryEntry(formatted, codeOn, wc, doc.recognitionTimeMs, uncertainWords);
+
+        std::wstring msg = L"Copied " + std::to_wstring(wc) + L" words from " + sourceLabel + L" (" +
+                           std::to_wstring(static_cast<int>(doc.recognitionTimeMs)) + L" ms)";
+        if (stripGutter && gutterStripped > 0) {
+            msg += L" \x2022 -" + std::to_wstring(gutterStripped) + L" line #s";
+        }
+        ShowToast(msg);
     } else {
         ShowToast(err.empty() ? (L"No text detected in " + sourceLabel + L".") : err, true);
     }
@@ -560,18 +592,26 @@ void HistoryWindow::BuildUiLayout(float width, float height) {
         }
     } else {
         struct ToggleDef { int id; const wchar_t* title; const wchar_t* desc; };
-        ToggleDef toggles[6] = {
+        ToggleDef toggles[8] = {
             { ACT_TOGGLE_CODE,      L"Code Indentation",      L"Preserve tabs & fix \x00F8 \x2192 0" },
+            { ACT_TOGGLE_GUTTER,    L"Strip Line Numbers",    L"Auto-remove editor gutter (1, 2, 3)" },
+            { ACT_TOGGLE_HEATMAP,   L"Confidence Heatmap",    L"Amber warning on uncertain words" },
             { ACT_TOGGLE_LINEMODE,  L"Full-Line Selection",   L"Select whole lines on drag" },
             { ACT_TOGGLE_AUTOCOPY,  L"Auto-Copy on Release",  L"Copy immediately on mouse up" },
             { ACT_TOGGLE_UPSCALE,   L"2x Super-Res Boost",    L"Sharpen dark-mode video frames" },
             { ACT_TOGGLE_AUTOCLOSE, L"Auto-Close Overlay",    L"Dismiss right after copying" },
             { ACT_TOGGLE_STARTWIN,  L"Start with Windows",    L"Launch silently in System Tray" }
         };
-        float tH = 54.0f;
-        float tGap = 8.0f;
-        for (int i = 0; i < 6; ++i) {
-            float ty = listTop + static_cast<float>(i) * (tH + tGap);
+        float tH = 50.0f;
+        float tGap = 7.0f;
+        float totalSettingsH = 8.0f * (tH + tGap);
+        m_maxListScrollY = std::max(0.0f, totalSettingsH - m_sidebarListRect.height);
+        m_targetListScrollY = std::clamp(m_targetListScrollY, 0.0f, m_maxListScrollY);
+        m_listScrollY = std::clamp(m_listScrollY, 0.0f, m_maxListScrollY);
+
+        for (int i = 0; i < 8; ++i) {
+            float ty = listTop + static_cast<float>(i) * (tH + tGap) - m_listScrollY;
+            if (ty + tH < listTop - 10.0f || ty > listBot + 10.0f) continue;
             m_hotspots.push_back({
                 toggles[i].id,
                 { sidePad, ty, sidebarW - sidePad * 2.0f, tH },
@@ -831,9 +871,9 @@ void HistoryWindow::OnPaint(HDC printHdc) {
                 D2D1_RECT_F prevR = D2D1::RectF(r.left + 12.0f, r.top + 33.0f, r.right - 12.0f, r.bottom - 8.0f);
                 m_renderTarget->DrawTextW(hs.title.c_str(), static_cast<UINT32>(hs.title.length()), m_monoSmallFormat.Get(), prevR, m_brush.Get());
             }
-        } else if (hs.id >= ACT_TOGGLE_CODE && hs.id <= ACT_TOGGLE_STARTWIN) {
+        } else if (hs.id >= ACT_TOGGLE_CODE && hs.id <= ACT_TOGGLE_HEATMAP) {
             int tIdx = hs.id - ACT_TOGGLE_CODE;
-            float anim = (tIdx >= 0 && tIdx < 6) ? m_toggleAnim[tIdx] : 0.0f;
+            float anim = (tIdx >= 0 && tIdx < 8) ? m_toggleAnim[tIdx] : 0.0f;
 
             m_brush->SetColor(UiTheme::LerpColor(UiTheme::BgSurface, UiTheme::BgSurfaceHover, hAnim));
             m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(r, 8.0f, 8.0f), m_brush.Get());
@@ -870,7 +910,7 @@ void HistoryWindow::OnPaint(HDC printHdc) {
     m_renderTarget->PopAxisAlignedClip();
 
     // Subtle sidebar list scrollbar indicator when scrollable (in right margin of rail)
-    if (m_activeTab == SidebarTab::History && m_maxListScrollY > 0.5f) {
+    if (m_maxListScrollY > 0.5f) {
         float trackH = std::max(24.0f, m_sidebarListRect.height - 8.0f);
         float totalListH = m_sidebarListRect.height + m_maxListScrollY;
         float thumbH = std::max(24.0f, trackH * (m_sidebarListRect.height / totalListH));
@@ -1019,16 +1059,33 @@ void HistoryWindow::OnPaint(HDC printHdc) {
             m_renderTarget->DrawTextW(m_selectedLang.c_str(), static_cast<UINT32>(m_selectedLang.length()), m_badgeFormat.Get(), langPill, m_brush.Get());
         }
 
+        float metaStartX = langPill.right + 12.0f;
+        bool showHeatmap = !m_settings || m_settings->showConfidenceHeatmap;
+        if (showHeatmap && !item.uncertainWords.empty()) {
+            std::wstring warnText = L"\x26A0 " + std::to_wstring(item.uncertainWords.size()) + L" uncertain";
+            float warnW = std::clamp(static_cast<float>(warnText.size()) * 7.0f + 18.0f, 88.0f, 134.0f);
+            D2D1_RECT_F warnPill = D2D1::RectF(metaStartX, edTop + 10.0f, metaStartX + warnW, edTop + 34.0f);
+            m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentAmber, 0.16f));
+            m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(warnPill, 6.0f, 6.0f), m_brush.Get());
+            m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentAmber, 0.55f));
+            m_renderTarget->DrawRoundedRectangle(D2D1::RoundedRect(warnPill, 6.0f, 6.0f), m_brush.Get(), 1.0f);
+            if (m_badgeFormat) {
+                m_brush->SetColor(UiTheme::AccentAmber);
+                m_renderTarget->DrawTextW(warnText.c_str(), static_cast<UINT32>(warnText.length()), m_badgeFormat.Get(), warnPill, m_brush.Get());
+            }
+            metaStartX = warnPill.right + 12.0f;
+        }
+
         std::wstringstream meta;
         meta << m_cachedLines.size() << L" lines  \x2022  " << item.wordCount << L" words";
         if (item.ocrTimeMs > 0.1) {
             meta << L"  \x2022  " << std::fixed << std::setprecision(0) << item.ocrTimeMs << L" ms";
         }
         std::wstring metaStr = meta.str();
-        if (m_bodyFormat) {
+        if (m_bodyFormat && metaStartX < mainX + mainW - 296.0f) {
             m_brush->SetColor(UiTheme::TextSecondary);
             m_renderTarget->DrawTextW(metaStr.c_str(), static_cast<UINT32>(metaStr.length()), m_bodyFormat.Get(),
-                                      D2D1::RectF(langPill.right + 12.0f, edTop + 14.0f, mainX + mainW - 286.0f, edTop + 34.0f), m_brush.Get());
+                                      D2D1::RectF(metaStartX, edTop + 14.0f, mainX + mainW - 286.0f, edTop + 34.0f), m_brush.Get());
         }
 
         // Scrollable Syntax-Highlighted Code Viewport
@@ -1087,7 +1144,34 @@ void HistoryWindow::OnPaint(HDC printHdc) {
                             }
                         }
                     }
-                    m_renderTarget->DrawTextLayout({ mainX + gutterW + 14.0f, ly }, layout.Get(), m_syntaxBrushes[0].Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+                    // Confidence Heatmap: highlight uncertain OCR words with warm Amber tint & underline
+                    float textOriginX = mainX + gutterW + 14.0f;
+                    if (showHeatmap && !item.uncertainWords.empty()) {
+                        for (const auto& uw : item.uncertainWords) {
+                            if (uw.size() < 2) continue;
+                            size_t pos = 0;
+                            while ((pos = lineStr.find(uw, pos)) != std::wstring::npos) {
+                                UINT32 hitCount = 0;
+                                DWRITE_HIT_TEST_METRICS metrics[4] = {};
+                                HRESULT hrHit = layout->HitTestTextRange(
+                                    static_cast<UINT32>(pos), static_cast<UINT32>(uw.size()),
+                                    textOriginX, ly, metrics, 4, &hitCount
+                                );
+                                if (SUCCEEDED(hrHit) && hitCount > 0) {
+                                    const auto& m = metrics[0];
+                                    D2D1_RECT_F ur = D2D1::RectF(m.left - 2.0f, ly, m.left + m.width + 2.0f, ly + lineH - 2.0f);
+                                    m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentAmber, 0.16f));
+                                    m_renderTarget->FillRoundedRectangle(D2D1::RoundedRect(ur, 3.0f, 3.0f), m_brush.Get());
+                                    m_brush->SetColor(UiTheme::WithAlpha(UiTheme::AccentAmber, 0.90f));
+                                    m_renderTarget->DrawLine({ ur.left + 1.0f, ur.bottom - 0.5f }, { ur.right - 1.0f, ur.bottom - 0.5f }, m_brush.Get(), 1.6f);
+                                }
+                                pos += uw.size();
+                            }
+                        }
+                    }
+
+                    m_renderTarget->DrawTextLayout({ textOriginX, ly }, layout.Get(), m_syntaxBrushes[0].Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
                 }
             }
         }
@@ -1281,7 +1365,7 @@ LRESULT HistoryWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         float step = 66.0f;
-        if (m_sidebarListRect.contains(m_mouseX, m_mouseY) && m_activeTab == SidebarTab::History) {
+        if (m_sidebarListRect.contains(m_mouseX, m_mouseY)) {
             m_targetListScrollY = std::clamp(m_targetListScrollY - (delta > 0 ? step : -step), 0.0f, m_maxListScrollY);
         } else {
             m_targetCodeScrollY = std::clamp(m_targetCodeScrollY - (delta > 0 ? step : -step), 0.0f, m_maxCodeScrollY);
@@ -1371,16 +1455,19 @@ LRESULT HistoryWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         for (const auto& hs : m_hotspots) {
-            bool hit = (hs.id >= ACT_HIST_ITEM_BASE)
+            bool inSidebarScroll = (hs.id >= ACT_HIST_ITEM_BASE) || (hs.id >= ACT_TOGGLE_CODE && hs.id <= ACT_TOGGLE_HEATMAP);
+            bool hit = inSidebarScroll
                 ? (m_sidebarListRect.contains(mx, my) && hs.bounds.contains(mx, my))
                 : hs.bounds.contains(mx, my);
             if (!hit) continue;
 
             if (hs.id == ACT_TAB_HISTORY) {
                 m_activeTab = SidebarTab::History;
+                m_listScrollY = m_targetListScrollY = 0.0f;
                 StartAnimationTimer();
             } else if (hs.id == ACT_TAB_SETTINGS) {
                 m_activeTab = SidebarTab::Settings;
+                m_listScrollY = m_targetListScrollY = 0.0f;
                 StartAnimationTimer();
             } else if (hs.id == ACT_HERO_REGION) {
                 ShowWindow(hwnd, SW_HIDE);
@@ -1427,6 +1514,16 @@ LRESULT HistoryWindow::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 } else {
                     ShowToast(L"Could not update Windows startup registry key.", true);
                 }
+                StartAnimationTimer();
+            } else if (hs.id == ACT_TOGGLE_GUTTER && m_settings) {
+                m_settings->stripLineNumbers = !m_settings->stripLineNumbers;
+                AppStorage::SaveSettings(*m_settings);
+                ShowToast(m_settings->stripLineNumbers ? L"Auto Line-Number Gutter Stripping enabled." : L"Line-Number Gutter Stripping disabled.");
+                StartAnimationTimer();
+            } else if (hs.id == ACT_TOGGLE_HEATMAP && m_settings) {
+                m_settings->showConfidenceHeatmap = !m_settings->showConfidenceHeatmap;
+                AppStorage::SaveSettings(*m_settings);
+                ShowToast(m_settings->showConfidenceHeatmap ? L"Confidence Heatmap enabled." : L"Confidence Heatmap hidden.");
                 StartAnimationTimer();
             } else if (hs.id == ACT_BTN_PASTE_IMG) {
                 RunOcrFromClipboard();

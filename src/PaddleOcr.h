@@ -39,6 +39,11 @@ public:
     // Detects + recognizes all text in the bitmap. Coordinates are mapped to overlay space using
     // bitmap.screenOriginX/Y and bitmap.scaleFactor.
     static bool Recognize(const RawBitmap& bitmap, OcrDocument& outDoc, std::wstring* outError = nullptr);
+
+    // Document-level cross-line identifier voting: repairs uncertain OCR identifiers that are
+    // within edit distance 1 of a unique high-confidence identifier elsewhere in the same snippet.
+    // Returns the number of tokens repaired.
+    static size_t RepairCrossLineIdentifiers(OcrDocument& doc);
 };
 
 } // namespace ScreenTextify

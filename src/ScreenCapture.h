@@ -27,8 +27,12 @@ public:
     static RawBitmap CaptureVirtualScreen();
 
     // Crops a sub-region from an existing RawBitmap (coordinates relative to bitmap 0,0)
-    // If upscaleFactor > 1, performs smooth bilinear upscaling for higher OCR accuracy on small video text
+    // If upscaleFactor > 1, performs Catmull-Rom bicubic upscaling + edge-preserving sharpening
     static RawBitmap CropAndScale(const RawBitmap& source, const RectF& region, int upscaleFactor = 1);
+
+    // Inspects the 4 border edges of `region` inside `source`; if foreground glyph ink touches
+    // a crop boundary, expands that edge outward (up to maxPadPx) until a clean margin is reached.
+    static RectF SmartExpandCropRegion(const RawBitmap& source, const RectF& region, int maxPadPx = 10);
 
     // Creates a synthetic dark-mode video code frame for self-testing OCR and indentation
     static RawBitmap CreateSyntheticCodeFrame(int width = 800, int height = 420);

@@ -4,6 +4,7 @@
 #include <cwctype>
 #include <numeric>
 #include <sstream>
+#include <unordered_set>
 
 namespace ScreenTextify {
 
@@ -36,40 +37,192 @@ struct VisualLine {
     }
 };
 
-} // namespace
+// Parses a pure positive editor line number (1..99999) with no punctuation/letters.
+bool TryParseLineNumber(const std::wstring& text, int& outNum) {
+    if (text.empty() || text.size() > 5) return false;
+    int val = 0;
+    for (wchar_t ch : text) {
+        if (ch < L'0' || ch > L'9') return false;
+        val = val * 10 + (ch - L'0');
+    }
+    if (val <= 0) return false;
+    outNum = val;
+    return true;
+}
 
-std::wstring TextFormatter::FormatDocument(
-    const OcrDocument& doc,
-    bool onlySelected,
-    bool preserveIndentation,
-    size_t* outWordCount
+bool IsMathOrListSecondToken(const std::wstring& tok) {
+    if (tok.empty()) return false;
+    wchar_t c = tok.front();
+    return c == L'+' || c == L'-' || c == L'*' || c == L'/' || c == L'=' || c == L'<' || c == L'>' || c == L',' || c == L']';
+}
+
+// Identifies editor line-number gutter tokens across clustered visual lines.
+// Returns the set of OcrWordBox pointers that belong to the left line-number gutter.
+std::unordered_set<const OcrWordBox*> DetectLineNumberGutterWords(
+    const std::vector<VisualLine>& visualLines,
+    float medianCharWidth
 ) {
-    std::vector<const OcrWordBox*> activeWords;
-    for (const auto& line : doc.lines) {
-        for (const auto& word : line.words) {
-            if (!onlySelected || word.selected) {
-                activeWords.push_back(&word);
+    std::unordered_set<const OcrWordBox*> gutterSet;
+    if (visualLines.size() < 2) return gutterSet;
+
+    struct Cand {
+        size_t lineIdx;
+        int num;
+        const OcrWordBox* word;
+        float leftX;
+        float rightX;
+        float gapToCode; // -1 if blank numbered line
+        bool hasCodeToRight;
+        bool secondIsMath;
+    };
+
+    std::vector<Cand> cands;
+    cands.reserve(visualLines.size());
+
+    for (size_t i = 0; i < visualLines.size(); ++i) {
+        const auto& vl = visualLines[i];
+        if (vl.words.empty()) continue;
+        const OcrWordBox* w0 = vl.words.front();
+        int num = 0;
+        if (!TryParseLineNumber(w0->text, num)) continue;
+
+        Cand c{};
+        c.lineIdx = i;
+        c.num = num;
+        c.word = w0;
+        c.leftX = w0->bounds.x;
+        c.rightX = w0->bounds.right();
+        c.hasCodeToRight = (vl.words.size() >= 2);
+        c.gapToCode = c.hasCodeToRight ? (vl.words[1]->bounds.x - w0->bounds.right()) : -1.0f;
+        c.secondIsMath = c.hasCodeToRight && IsMathOrListSecondToken(vl.words[1]->text);
+        cands.push_back(c);
+    }
+
+    if (cands.size() < 2) return gutterSet;
+
+    // 1. Check column alignment: right-aligned (VS Code / JetBrains / GitHub / Vim) OR left-aligned
+    std::vector<float> rights, lefts;
+    rights.reserve(cands.size());
+    lefts.reserve(cands.size());
+    for (const auto& c : cands) {
+        rights.push_back(c.rightX);
+        lefts.push_back(c.leftX);
+    }
+    std::sort(rights.begin(), rights.end());
+    std::sort(lefts.begin(), lefts.end());
+    float medRight = rights[rights.size() / 2];
+    float medLeft = lefts[lefts.size() / 2];
+    float alignTol = std::max(8.0f, medianCharWidth * 1.45f);
+
+    std::vector<Cand> rightInliers, leftInliers;
+    for (const auto& c : cands) {
+        if (std::abs(c.rightX - medRight) <= alignTol) rightInliers.push_back(c);
+        if (std::abs(c.leftX - medLeft) <= alignTol) leftInliers.push_back(c);
+    }
+    const auto& aligned = (rightInliers.size() >= leftInliers.size()) ? rightInliers : leftInliers;
+
+    // Require >= 3 aligned line numbers, OR exactly 2 consecutive lines (e.g. 2-line crop) both with code to the right
+    bool validCount = (aligned.size() >= 3 && aligned.size() * 10 >= visualLines.size() * 6) ||
+                      (visualLines.size() == 2 && aligned.size() == 2 && aligned[0].hasCodeToRight && aligned[1].hasCodeToRight);
+    if (!validCount) return gutterSet;
+
+    // 2. Check strictly increasing near-consecutive sequence (1 <= delta <= 4, tolerates wrapped/blank lines)
+    int goodStepPairs = 0;
+    int totalPairs = static_cast<int>(aligned.size()) - 1;
+    for (size_t i = 1; i < aligned.size(); ++i) {
+        int delta = aligned[i].num - aligned[i - 1].num;
+        int lineStep = static_cast<int>(aligned[i].lineIdx - aligned[i - 1].lineIdx);
+        if (delta >= 1 && delta <= std::max(4, lineStep * 3)) {
+            ++goodStepPairs;
+        }
+    }
+    if (totalPairs == 1) {
+        if (aligned[1].num - aligned[0].num != 1) return gutterSet;
+    } else if (goodStepPairs * 100 < totalPairs * 80) {
+        return gutterSet;
+    }
+
+    // 3. Verify clean vertical whitespace lane between gutter column and code column
+    float gutterRightMax = -1e9f;
+    std::vector<float> gaps;
+    int codeLines = 0;
+    int mathSecondLines = 0;
+    for (const auto& c : aligned) {
+        gutterRightMax = std::max(gutterRightMax, c.rightX);
+        if (c.hasCodeToRight) {
+            ++codeLines;
+            gaps.push_back(c.gapToCode);
+            if (c.secondIsMath) ++mathSecondLines;
+        }
+    }
+    if (codeLines == 0) return gutterSet;
+    // Reject arithmetic expressions like "1 + 2 / 2 + 3 / 3 + 4"
+    if (mathSecondLines * 2 >= codeLines) return gutterSet;
+
+    std::sort(gaps.begin(), gaps.end());
+    float medGap = gaps[gaps.size() / 2];
+    if (medGap < medianCharWidth * 1.35f) return gutterSet;
+
+    // Ensure non-gutter code tokens across ALL lines lie cleanly to the right of the gutter column
+    int cleanCodeLines = 0;
+    int totalCodeLines = 0;
+    for (size_t i = 0; i < visualLines.size(); ++i) {
+        const auto& vl = visualLines[i];
+        bool isAlignedGutterLine = false;
+        for (const auto& c : aligned) {
+            if (c.lineIdx == i) { isAlignedGutterLine = true; break; }
+        }
+        size_t startW = isAlignedGutterLine ? 1 : 0;
+        if (startW < vl.words.size()) {
+            ++totalCodeLines;
+            if (vl.words[startW]->bounds.x >= gutterRightMax + medianCharWidth * 0.35f) {
+                ++cleanCodeLines;
             }
         }
     }
-
-    if (outWordCount) {
-        *outWordCount = activeWords.size();
+    if (totalCodeLines == 0 || cleanCodeLines * 10 < totalCodeLines * 8) {
+        return gutterSet;
     }
 
-    if (activeWords.empty()) {
-        return L"";
+    // Confirmed! Mark all aligned gutter tokens
+    for (const auto& c : aligned) {
+        gutterSet.insert(c.word);
     }
 
-    // Estimate median character width & word height
+    // Also catch any single OCR-corrupted gutter token (e.g. "l2" between "11" and "13") strictly inside the gutter X-lane
+    for (size_t i = 0; i < visualLines.size(); ++i) {
+        const auto& vl = visualLines[i];
+        if (vl.words.empty()) continue;
+        const OcrWordBox* w0 = vl.words.front();
+        if (gutterSet.count(w0)) continue;
+        if (w0->text.size() <= 5 &&
+            w0->bounds.right() <= gutterRightMax + medianCharWidth * 0.55f &&
+            (vl.words.size() == 1 || vl.words[1]->bounds.x >= gutterRightMax + medianCharWidth * 0.85f)) {
+            gutterSet.insert(w0);
+        }
+    }
+
+    return gutterSet;
+}
+
+void BuildVisualLines(
+    const std::vector<const OcrWordBox*>& words,
+    std::vector<VisualLine>& outLines,
+    float& outMedianCharWidth,
+    float& outMedianWordHeight
+) {
+    outLines.clear();
+    outMedianCharWidth = 10.0f;
+    outMedianWordHeight = 18.0f;
+    if (words.empty()) return;
+
     std::vector<float> charWidths;
     std::vector<float> wordHeights;
-    charWidths.reserve(activeWords.size());
-    wordHeights.reserve(activeWords.size());
+    charWidths.reserve(words.size());
+    wordHeights.reserve(words.size());
 
-    for (const auto* w : activeWords) {
+    for (const auto* w : words) {
         if (!w->text.empty() && w->bounds.width > 1.0f) {
-            // Prefer multi-character words for stable monospace/proportional width estimation
             if (w->text.length() >= 2) {
                 charWidths.push_back(w->bounds.width / static_cast<float>(w->text.length()));
             }
@@ -78,40 +231,32 @@ std::wstring TextFormatter::FormatDocument(
             wordHeights.push_back(w->bounds.height);
         }
     }
-
     if (charWidths.empty()) {
-        for (const auto* w : activeWords) {
+        for (const auto* w : words) {
             if (!w->text.empty() && w->bounds.width > 1.0f) {
                 charWidths.push_back(w->bounds.width / static_cast<float>(w->text.length()));
             }
         }
     }
 
-    float medianCharWidth = 10.0f;
     if (!charWidths.empty()) {
         std::sort(charWidths.begin(), charWidths.end());
-        medianCharWidth = charWidths[charWidths.size() / 2];
-        medianCharWidth = std::max(3.0f, medianCharWidth);
+        outMedianCharWidth = std::max(3.0f, charWidths[charWidths.size() / 2]);
     }
-
-    float medianWordHeight = 18.0f;
     if (!wordHeights.empty()) {
         std::sort(wordHeights.begin(), wordHeights.end());
-        medianWordHeight = wordHeights[wordHeights.size() / 2];
-        medianWordHeight = std::max(6.0f, medianWordHeight);
+        outMedianWordHeight = std::max(6.0f, wordHeights[wordHeights.size() / 2]);
     }
 
-    // Sort words primarily by vertical center to cluster into visual lines
-    std::sort(activeWords.begin(), activeWords.end(), [](const OcrWordBox* a, const OcrWordBox* b) {
+    std::vector<const OcrWordBox*> sorted = words;
+    std::sort(sorted.begin(), sorted.end(), [](const OcrWordBox* a, const OcrWordBox* b) {
         return a->bounds.centerY() < b->bounds.centerY();
     });
 
-    std::vector<VisualLine> visualLines;
-    float lineClusterThreshold = medianWordHeight * 0.58f;
-
-    for (const auto* w : activeWords) {
+    float lineClusterThreshold = outMedianWordHeight * 0.58f;
+    for (const auto* w : sorted) {
         bool placed = false;
-        for (auto& vline : visualLines) {
+        for (auto& vline : outLines) {
             float overlapY = std::min(w->bounds.bottom(), vline.maxY) - std::max(w->bounds.y, vline.minY);
             float minH = std::min(w->bounds.height, vline.height);
             if (std::abs(w->bounds.centerY() - vline.centerY) <= lineClusterThreshold ||
@@ -126,37 +271,129 @@ std::wstring TextFormatter::FormatDocument(
             VisualLine newLine;
             newLine.words.push_back(w);
             newLine.recomputeMetrics();
-            visualLines.push_back(std::move(newLine));
+            outLines.push_back(std::move(newLine));
         }
     }
 
-    // Merge any visualLines that overlap vertically after word additions
-    for (size_t i = 0; i < visualLines.size(); ++i) {
-        for (size_t j = i + 1; j < visualLines.size(); ) {
-            float overlapY = std::min(visualLines[i].maxY, visualLines[j].maxY) - std::max(visualLines[i].minY, visualLines[j].minY);
-            float minH = std::min(visualLines[i].height, visualLines[j].height);
-            if (std::abs(visualLines[i].centerY - visualLines[j].centerY) <= lineClusterThreshold ||
+    for (size_t i = 0; i < outLines.size(); ++i) {
+        for (size_t j = i + 1; j < outLines.size(); ) {
+            float overlapY = std::min(outLines[i].maxY, outLines[j].maxY) - std::max(outLines[i].minY, outLines[j].minY);
+            float minH = std::min(outLines[i].height, outLines[j].height);
+            if (std::abs(outLines[i].centerY - outLines[j].centerY) <= lineClusterThreshold ||
                 (minH > 1.0f && overlapY >= minH * 0.50f)) {
-                for (const auto* w : visualLines[j].words) {
-                    visualLines[i].words.push_back(w);
+                for (const auto* w : outLines[j].words) {
+                    outLines[i].words.push_back(w);
                 }
-                visualLines[i].recomputeMetrics();
-                visualLines.erase(visualLines.begin() + j);
+                outLines[i].recomputeMetrics();
+                outLines.erase(outLines.begin() + j);
             } else {
                 ++j;
             }
         }
     }
 
-    // Sort visual lines top-to-bottom
-    std::sort(visualLines.begin(), visualLines.end(), [](const VisualLine& a, const VisualLine& b) {
+    std::sort(outLines.begin(), outLines.end(), [](const VisualLine& a, const VisualLine& b) {
         return a.centerY < b.centerY;
     });
+}
 
-    // Find minimum left X coordinate across all visual lines
+} // namespace
+
+size_t TextFormatter::MarkLineNumberGutter(OcrDocument& doc) {
+    std::vector<const OcrWordBox*> allWords;
+    for (auto& line : doc.lines) {
+        for (auto& word : line.words) {
+            word.isLineNumber = false;
+            allWords.push_back(&word);
+        }
+    }
+    if (allWords.size() < 2) return 0;
+
+    std::vector<VisualLine> visualLines;
+    float medCharW = 10.0f, medWordH = 18.0f;
+    BuildVisualLines(allWords, visualLines, medCharW, medWordH);
+
+    auto gutterSet = DetectLineNumberGutterWords(visualLines, medCharW);
+    if (gutterSet.empty()) return 0;
+
+    size_t marked = 0;
+    for (auto& line : doc.lines) {
+        for (auto& word : line.words) {
+            if (gutterSet.count(&word)) {
+                word.isLineNumber = true;
+                ++marked;
+            }
+        }
+    }
+    return marked;
+}
+
+std::wstring TextFormatter::FormatDocument(
+    const OcrDocument& doc,
+    bool onlySelected,
+    bool preserveIndentation,
+    size_t* outWordCount,
+    bool stripLineNumbers
+) {
+    std::vector<const OcrWordBox*> activeWords;
+    for (const auto& line : doc.lines) {
+        for (const auto& word : line.words) {
+            if (!onlySelected || word.selected) {
+                activeWords.push_back(&word);
+            }
+        }
+    }
+
+    if (activeWords.empty()) {
+        if (outWordCount) *outWordCount = 0;
+        return L"";
+    }
+
+    std::vector<VisualLine> visualLines;
+    float medianCharWidth = 10.0f;
+    float medianWordHeight = 18.0f;
+    BuildVisualLines(activeWords, visualLines, medianCharWidth, medianWordHeight);
+
+    // Strip auto-detected editor line-number gutter tokens (both pre-marked and freshly detected)
+    std::unordered_set<const OcrWordBox*> gutterSet;
+    if (stripLineNumbers) {
+        for (const auto* w : activeWords) {
+            if (w->isLineNumber) gutterSet.insert(w);
+        }
+        if (gutterSet.empty()) {
+            gutterSet = DetectLineNumberGutterWords(visualLines, medianCharWidth);
+        }
+        if (!gutterSet.empty()) {
+            for (auto& vl : visualLines) {
+                vl.words.erase(
+                    std::remove_if(vl.words.begin(), vl.words.end(), [&](const OcrWordBox* w) {
+                        return gutterSet.count(w) > 0;
+                    }),
+                    vl.words.end()
+                );
+                if (!vl.words.empty()) {
+                    vl.recomputeMetrics();
+                }
+            }
+            // Trim leading/trailing empty lines left by blank gutter numbers
+            while (!visualLines.empty() && visualLines.front().words.empty()) visualLines.erase(visualLines.begin());
+            while (!visualLines.empty() && visualLines.back().words.empty()) visualLines.pop_back();
+        }
+    }
+
+    size_t finalWordCount = 0;
+    for (const auto& vl : visualLines) finalWordCount += vl.words.size();
+    if (outWordCount) *outWordCount = finalWordCount;
+    if (finalWordCount == 0) return L"";
+
+    // Find minimum left X coordinate across all remaining non-empty visual lines
     float minLeftX = 1e9f;
+    size_t nonEmptyLineCount = 0;
     for (const auto& vline : visualLines) {
-        minLeftX = std::min(minLeftX, vline.leftX);
+        if (!vline.words.empty()) {
+            minLeftX = std::min(minLeftX, vline.leftX);
+            ++nonEmptyLineCount;
+        }
     }
 
     std::wstring output;
@@ -165,8 +402,8 @@ std::wstring TextFormatter::FormatDocument(
 
         if (i > 0) {
             output += L"\r\n";
-            // If preserveIndentation is enabled and there is a significant vertical gap, insert a blank line
-            if (preserveIndentation) {
+            // If preserveIndentation is enabled and there is a significant vertical gap (and previous line wasn't already an explicit blank gutter line)
+            if (preserveIndentation && !vline.words.empty() && !visualLines[i - 1].words.empty()) {
                 float prevBottom = visualLines[i - 1].maxY;
                 float verticalGap = vline.minY - prevBottom;
                 if (verticalGap > medianWordHeight * 1.65f) {
@@ -175,11 +412,14 @@ std::wstring TextFormatter::FormatDocument(
             }
         }
 
+        if (vline.words.empty()) {
+            continue; // Blank numbered line in editor gutter
+        }
+
         // Compute leading indentation spaces in Code Mode
-        if (preserveIndentation && visualLines.size() > 1) {
+        if (preserveIndentation && nonEmptyLineCount > 1) {
             float indentPx = std::max(0.0f, vline.leftX - minLeftX);
             int numSpaces = static_cast<int>(std::round(indentPx / medianCharWidth));
-            // Ignore tiny 1-space jitter caused by font kerning
             if (numSpaces == 1 && indentPx < medianCharWidth * 1.35f) {
                 numSpaces = 0;
             }
@@ -194,8 +434,6 @@ std::wstring TextFormatter::FormatDocument(
             const auto* word = vline.words[wIdx];
             std::wstring token = word->text;
             if (preserveIndentation) {
-                // Monospace coding fonts (Consolas, JetBrains Mono, Cascadia) use slashed zeros,
-                // which Windows OCR frequently decodes as 'ø' (U+00F8) or 'Ø' (U+00D8).
                 for (wchar_t& ch : token) {
                     if (ch == L'\x00F8' || ch == L'\x00D8') {
                         ch = L'0';
@@ -213,14 +451,10 @@ std::wstring TextFormatter::FormatDocument(
                     wchar_t lastCh = prevText.back();
                     wchar_t firstCh = token.front();
 
-                    // If bounding boxes are visually touching (less than 45% of a character width),
-                    // they belong to the same programming token (e.g. "findOne(message?" + "._id)"),
-                    // except ') {' or '> {' which are always space-separated in block headers.
                     if (gapPx < medianCharWidth * 0.45f &&
                         !((lastCh == L')' || lastCh == L'>') && firstCh == L'{')) {
                         shouldGlue = true;
                     }
-                    // Member access / method chaining / optional chaining / parens where OCR split tokens
                     if (gapPx < medianCharWidth * 0.78f && (firstCh == L'(' || firstCh == L'[' || firstCh == L'?')) {
                         shouldGlue = true;
                     }

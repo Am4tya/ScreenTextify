@@ -27,6 +27,7 @@
 #include <mutex>
 #include <numeric>
 #include <thread>
+#include <unordered_map>
 
 namespace ScreenTextify {
 
@@ -40,7 +41,7 @@ constexpr int kRecMaxWidth = 3200;
 
 struct Recognizer {
     std::wstring name;
-    Ort::Session session{ nullptr };
+    std::vector<Ort::Session> sessions;  // 1 private session per worker -> lock-free BFCArena + MemPattern!
     std::string inName, outName;
     std::vector<std::wstring> alphabet;  // index 0 = CTC blank
     std::vector<int> allowed;            // class indices decodable to code ASCII (0 = blank included)
@@ -117,15 +118,46 @@ wchar_t ToCodeAscii(wchar_t c) {
     }
 }
 
+// Determine optimal physical-core worker count (avoids SMT AVX2 FMA unit contention on Zen/Core CPUs)
+size_t OptimalWorkerCount(size_t taskCount) {
+    if (taskCount <= 1) return 1;
+    unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    size_t physEst = (hw >= 8) ? (hw / 2) : hw;
+    size_t maxWorkers = std::clamp<size_t>(physEst, 2, 6);
+    return std::min(taskCount, maxWorkers);
+}
+
 std::unique_ptr<Recognizer> LoadRecognizer(Engine& e, const std::wstring& name, const fs::path& model, const fs::path& dict) {
     auto r = std::make_unique<Recognizer>();
     r->name = name;
-    r->session = Ort::Session(e.env, model.c_str(), e.opts);
-    Ort::AllocatorWithDefaultOptions alloc;
-    r->inName = r->session.GetInputNameAllocated(0, alloc).get();
-    r->outName = r->session.GetOutputNameAllocated(0, alloc).get();
 
-    auto outShape = r->session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+    // Read model file once into memory, then build 1 private Ort::Session per physical worker core
+    std::ifstream mf(model, std::ios::binary | std::ios::ate);
+    std::streamsize sz = mf.tellg();
+    mf.seekg(0, std::ios::beg);
+    std::vector<char> modelBytes(static_cast<size_t>(std::max<std::streamsize>(0, sz)));
+    if (sz > 0) mf.read(modelBytes.data(), sz);
+
+    const size_t numSlots = OptimalWorkerCount(6);
+    std::vector<std::unique_ptr<Ort::Session>> loaded(numSlots);
+    // Construct private per-worker Ort::Sessions in parallel from the in-memory model buffer
+    std::vector<std::thread> initThreads;
+    initThreads.reserve(numSlots > 1 ? numSlots - 1 : 0);
+    auto buildSlot = [&](size_t s) {
+        loaded[s] = std::make_unique<Ort::Session>(e.env, modelBytes.data(), modelBytes.size(), e.opts);
+    };
+    for (size_t s = 1; s < numSlots; ++s) initThreads.emplace_back(buildSlot, s);
+    buildSlot(0);
+    for (auto& t : initThreads) t.join();
+
+    r->sessions.reserve(numSlots);
+    for (auto& up : loaded) r->sessions.push_back(std::move(*up));
+
+    Ort::AllocatorWithDefaultOptions alloc;
+    r->inName = r->sessions[0].GetInputNameAllocated(0, alloc).get();
+    r->outName = r->sessions[0].GetOutputNameAllocated(0, alloc).get();
+
+    auto outShape = r->sessions[0].GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
     int64_t numClasses = outShape.empty() ? -1 : outShape.back();
 
     r->alphabet.push_back(L"");  // CTC blank at index 0
@@ -181,9 +213,12 @@ void DoInitialize() {
         engine->env = Ort::Env(ORT_LOGGING_LEVEL_ERROR, "ScreenTextify");
 
         engine->opts = Ort::SessionOptions();
-        unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        engine->opts.SetIntraOpNumThreads(static_cast<int>(std::clamp(hw / 2u, 2u, 8u)));
+        // Each worker thread owns its own private Ort::Session with intra_op=1 and full BFCArena +
+        // MemPattern enabled — zero cross-thread arena lock contention and zero heap churn.
+        engine->opts.SetIntraOpNumThreads(1);
         engine->opts.SetInterOpNumThreads(1);
+        engine->opts.EnableCpuMemArena();
+        engine->opts.EnableMemPattern();
         engine->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         engine->opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
@@ -213,6 +248,36 @@ void DoInitialize() {
     }
 }
 
+// Lightweight work-stealing parallel-for helper (calling thread participates as worker #0)
+template <typename Fn>
+void ParallelFor(size_t count, Fn&& fn) {
+    if (count == 0) return;
+    size_t numWorkers = OptimalWorkerCount(count);
+    if (numWorkers <= 1) {
+        for (size_t i = 0; i < count; ++i) fn(i);
+        return;
+    }
+
+    std::atomic<size_t> nextIdx{ 0 };
+    std::vector<std::thread> workers;
+    workers.reserve(numWorkers - 1);
+    for (size_t t = 0; t + 1 < numWorkers; ++t) {
+        workers.emplace_back([&]() {
+            while (true) {
+                size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= count) break;
+                fn(idx);
+            }
+        });
+    }
+    while (true) {
+        size_t idx = nextIdx.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= count) break;
+        fn(idx);
+    }
+    for (auto& w : workers) w.join();
+}
+
 // ------------------------------------------------------------------------------------------------
 // Step 1: Dual-View Preprocessing + 8-Connected Component Ink Mask
 // ------------------------------------------------------------------------------------------------
@@ -235,170 +300,36 @@ struct PreprocessedFrame {
     RawBitmap cleanBmp;              // Contrast-equalized + sharpened black-on-white BGRA8 bitmap
     RawBitmap rawNormBmp;            // Polarity-normalized direct BGR view (for dual-view verification)
     std::vector<uint8_t> inkMask;    // 1 where foreground glyph ink is present
+    std::vector<uint8_t> maxDeltaMap;// Per-pixel max RGB contrast delta from local background (for faint-line rescue)
     std::vector<InkComponent> comps; // Filtered glyph connected components
     float medGlyphH = 18.0f;
+    float p90GlyphH = 22.0f;
+    float scaleFactor = 1.0f;
 };
 
-PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
-    PreprocessedFrame pf;
-    const int srcW = src.width;
-    const int srcH = src.height;
-    const size_t totalPixels = static_cast<size_t>(srcW) * srcH;
-    const uint8_t* srcPx = src.pixels.data();
+void ExtractInkComponents(
+    const std::vector<uint8_t>& mask,
+    int srcW, int srcH,
+    int yStart, int yEnd,
+    std::vector<InkComponent>& outComps
+) {
+    outComps.clear();
+    yStart = std::clamp(yStart, 0, srcH);
+    yEnd = std::clamp(yEnd, yStart, srcH);
+    int bandH = yEnd - yStart;
+    if (bandH <= 0 || srcW <= 0) return;
 
-    pf.cleanBmp.width = srcW;
-    pf.cleanBmp.height = srcH;
-    pf.cleanBmp.stride = srcW * 4;
-    pf.cleanBmp.scaleFactor = src.scaleFactor;
-    pf.cleanBmp.screenOriginX = src.screenOriginX;
-    pf.cleanBmp.screenOriginY = src.screenOriginY;
-    pf.cleanBmp.pixels.resize(totalPixels * 4, 255);
-
-    pf.rawNormBmp = pf.cleanBmp;
-    pf.inkMask.assign(totalPixels, 0);
-
-    uint64_t lumSum = 0;
-    for (size_t i = 0; i < totalPixels; i += 4) {
-        uint32_t b = srcPx[i * 4 + 0];
-        uint32_t g = srcPx[i * 4 + 1];
-        uint32_t r = srcPx[i * 4 + 2];
-        lumSum += (r * 77 + g * 150 + b * 29) >> 8;
-    }
-    uint32_t avgLum = (totalPixels > 0) ? static_cast<uint32_t>(lumSum / ((totalPixels + 3) / 4)) : 128;
-    bool isDarkTheme = (avgLum < 140);
-
-    const int cellW = std::max(36, static_cast<int>(36.0f * src.scaleFactor));
-    const int cellH = 2;
-    const int gridW = (srcW + cellW - 1) / cellW;
-    const int gridH = (srcH + cellH - 1) / cellH;
-
-    struct RgbBg { int r, g, b; };
-    std::vector<RgbBg> bgGrid(static_cast<size_t>(gridW) * gridH);
-
-    struct SamplePx { int lum, r, g, b; };
-    std::vector<SamplePx> cellSamples;
-    cellSamples.reserve(128);
-
-    for (int gy = 0; gy < gridH; ++gy) {
-        int y0 = gy * cellH;
-        int y1 = std::min(srcH, y0 + cellH);
-        for (int gx = 0; gx < gridW; ++gx) {
-            int x0 = std::max(0, gx * cellW - cellW / 4);
-            int x1 = std::min(srcW, (gx + 1) * cellW + cellW / 4);
-
-            cellSamples.clear();
-            for (int y = y0; y < y1; ++y) {
-                const uint8_t* row = srcPx + static_cast<size_t>(y) * src.stride;
-                for (int x = x0; x < x1; x += 2) {
-                    int b = row[x * 4 + 0];
-                    int g = row[x * 4 + 1];
-                    int r = row[x * 4 + 2];
-                    int lum = (r * 77 + g * 150 + b * 29) >> 8;
-                    cellSamples.push_back({ lum, r, g, b });
-                }
-            }
-
-            if (cellSamples.empty()) {
-                bgGrid[static_cast<size_t>(gy) * gridW + gx] = isDarkTheme ? RgbBg{ 24, 24, 28 } : RgbBg{ 245, 245, 245 };
-            } else {
-                size_t targetIdx = isDarkTheme ? (cellSamples.size() / 4) : ((cellSamples.size() * 3) / 4);
-                std::nth_element(cellSamples.begin(), cellSamples.begin() + targetIdx, cellSamples.end(),
-                    [](const SamplePx& a, const SamplePx& b) { return a.lum < b.lum; });
-                const auto& bg = cellSamples[targetIdx];
-                bgGrid[static_cast<size_t>(gy) * gridW + gx] = { bg.r, bg.g, bg.b };
-            }
-        }
-    }
-
-    for (int y = 0; y < srcH; ++y) {
-        int gy = std::clamp(y / cellH, 0, gridH - 1);
-        const uint8_t* sRow = srcPx + static_cast<size_t>(y) * src.stride;
-        uint8_t* dRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
-        uint8_t* nRow = pf.rawNormBmp.pixels.data() + static_cast<size_t>(y) * pf.rawNormBmp.stride;
-        uint8_t* mRow = pf.inkMask.data() + static_cast<size_t>(y) * srcW;
-
-        for (int x = 0; x < srcW; ++x) {
-            float fx = (static_cast<float>(x) + 0.5f) / cellW - 0.5f;
-            int gx0 = std::clamp(static_cast<int>(std::floor(fx)), 0, gridW - 1);
-            int gx1 = std::min(gx0 + 1, gridW - 1);
-            float wx = std::clamp(fx - gx0, 0.0f, 1.0f);
-
-            const auto& c0 = bgGrid[static_cast<size_t>(gy) * gridW + gx0];
-            const auto& c1 = bgGrid[static_cast<size_t>(gy) * gridW + gx1];
-
-            int bgR = static_cast<int>(c0.r * (1.0f - wx) + c1.r * wx);
-            int bgG = static_cast<int>(c0.g * (1.0f - wx) + c1.g * wx);
-            int bgB = static_cast<int>(c0.b * (1.0f - wx) + c1.b * wx);
-
-            int b = sRow[x * 4 + 0];
-            int g = sRow[x * 4 + 1];
-            int r = sRow[x * 4 + 2];
-
-            uint8_t ink = 255;
-            uint8_t gentleInk = 255;
-            int maxD = 0;
-            if (isDarkTheme) {
-                int dR = std::max(0, r - bgR);
-                int dG = std::max(0, g - bgG);
-                int dB = std::max(0, b - bgB);
-                maxD = std::max({ dR, dG, dB });
-                int lumD = (dR * 77 + dG * 150 + dB * 29) >> 8;
-                int delta = (maxD * 2 + lumD) / 3;
-
-                if (delta > 19) {
-                    float t = std::clamp(static_cast<float>(delta - 19) / 100.0f, 0.0f, 1.0f);
-                    float smooth = t * t * (3.0f - 2.0f * t);
-                    ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
-                }
-                if (delta > 12) {
-                    float tg = std::clamp(static_cast<float>(delta - 12) / 145.0f, 0.0f, 1.0f);
-                    gentleInk = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - tg), 0.0f, 255.0f));
-                }
-            } else {
-                int dR = std::max(0, bgR - r);
-                int dG = std::max(0, bgG - g);
-                int dB = std::max(0, bgB - b);
-                maxD = std::max({ dR, dG, dB });
-
-                if (maxD > 17) {
-                    float t = std::clamp(static_cast<float>(maxD - 17) / 104.0f, 0.0f, 1.0f);
-                    float smooth = t * t * (3.0f - 2.0f * t);
-                    ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
-                }
-                if (maxD > 10) {
-                    float tg = std::clamp(static_cast<float>(maxD - 10) / 145.0f, 0.0f, 1.0f);
-                    gentleInk = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - tg), 0.0f, 255.0f));
-                }
-            }
-
-            dRow[x * 4 + 0] = ink;
-            dRow[x * 4 + 1] = ink;
-            dRow[x * 4 + 2] = ink;
-            dRow[x * 4 + 3] = 255;
-
-            nRow[x * 4 + 0] = gentleInk;
-            nRow[x * 4 + 1] = gentleInk;
-            nRow[x * 4 + 2] = gentleInk;
-            nRow[x * 4 + 3] = 255;
-
-            if (maxD >= 36 || ink < 190) {
-                mRow[x] = 1;
-            }
-        }
-    }
-
-    // Extract 8-connected components from inkMask with 5-zone vertical curvature profiles
-    std::vector<uint8_t> visited(totalPixels, 0);
+    std::vector<uint8_t> visited(static_cast<size_t>(srcW) * bandH, 0);
     struct Pt { int x, y; };
     std::vector<Pt> pts;
     pts.reserve(256);
-    std::vector<InkComponent> rawComps;
 
-    for (int y = 0; y < srcH; ++y) {
+    for (int y = yStart; y < yEnd; ++y) {
         for (int x = 0; x < srcW; ++x) {
-            size_t idx0 = static_cast<size_t>(y) * srcW + x;
-            if (!pf.inkMask[idx0] || visited[idx0]) continue;
-            visited[idx0] = 1;
+            size_t mIdx = static_cast<size_t>(y) * srcW + x;
+            size_t vIdx = static_cast<size_t>(y - yStart) * srcW + x;
+            if (!mask[mIdx] || visited[vIdx]) continue;
+            visited[vIdx] = 1;
             pts.clear();
             pts.push_back({ x, y });
 
@@ -416,13 +347,14 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
 
                 for (int dy = -1; dy <= 1; ++dy) {
                     int ny = cur.y + dy;
-                    if (ny < 0 || ny >= srcH) continue;
+                    if (ny < yStart || ny >= yEnd) continue;
                     for (int dx = -1; dx <= 1; ++dx) {
                         int nx = cur.x + dx;
                         if (nx < 0 || nx >= srcW) continue;
-                        size_t nIdx = static_cast<size_t>(ny) * srcW + nx;
-                        if (!visited[nIdx] && pf.inkMask[nIdx]) {
-                            visited[nIdx] = 1;
+                        size_t nmIdx = static_cast<size_t>(ny) * srcW + nx;
+                        size_t nvIdx = static_cast<size_t>(ny - yStart) * srcW + nx;
+                        if (!visited[nvIdx] && mask[nmIdx]) {
+                            visited[nvIdx] = 1;
                             pts.push_back({ nx, ny });
                         }
                     }
@@ -451,10 +383,379 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
                 comp.midMeanX = cnt[2] > 0 ? (sum[2] / cnt[2]) : cx;
                 comp.loStemX  = cnt[3] > 0 ? (sum[3] / cnt[3]) : cx;
                 comp.botMeanX = cnt[4] > 0 ? (sum[4] / cnt[4]) : cx;
-                rawComps.push_back(comp);
+                outComps.push_back(comp);
             }
         }
     }
+}
+
+// Suppresses thin red/yellow wavy ESLint/TypeScript error squiggles sitting beneath text baselines
+void SuppressEditorSquiggles(const RawBitmap& src, PreprocessedFrame& pf) {
+    const int srcW = src.width;
+    const int srcH = src.height;
+    const float sc = std::max(1.0f, src.scaleFactor);
+    const size_t total = static_cast<size_t>(srcW) * srcH;
+
+    std::vector<uint8_t> sqMask(total, 0);
+    bool anyCand = false;
+    for (int y = 0; y < srcH; ++y) {
+        const uint8_t* sRow = src.pixels.data() + static_cast<size_t>(y) * src.stride;
+        uint8_t* qRow = sqMask.data() + static_cast<size_t>(y) * srcW;
+        const uint8_t* mRow = pf.inkMask.data() + static_cast<size_t>(y) * srcW;
+        for (int x = 0; x < srcW; ++x) {
+            if (!mRow[x]) continue;
+            int b = sRow[x * 4 + 0];
+            int g = sRow[x * 4 + 1];
+            int r = sRow[x * 4 + 2];
+            // High-saturation error red (#F14C4C / #E51400) or warning yellow (#CCA700 / #EAB308)
+            bool isErrRed = (r >= 145) && (r - std::max(g, b) >= 72);
+            bool isWarnYel = (r >= 150) && (g >= 115) && (std::min(r, g) - b >= 80) && (r - g <= 65);
+            if (isErrRed || isWarnYel) {
+                qRow[x] = 1;
+                anyCand = true;
+            }
+        }
+    }
+    if (!anyCand) return;
+
+    const int maxSqH = std::max(4, static_cast<int>(std::ceil(3.8f * sc)));
+    const int minSqW = std::max(8, static_cast<int>(10.0f * sc));
+    const int lookUpMin = std::max(2, static_cast<int>(2.0f * sc));
+    const int lookUpMax = std::max(10, static_cast<int>(14.0f * sc));
+
+    std::vector<uint8_t> visited(total, 0);
+    struct Pt { int x, y; };
+    std::vector<Pt> pts;
+    pts.reserve(256);
+
+    for (int y = 0; y < srcH; ++y) {
+        for (int x = 0; x < srcW; ++x) {
+            size_t idx0 = static_cast<size_t>(y) * srcW + x;
+            if (!sqMask[idx0] || visited[idx0]) continue;
+            visited[idx0] = 1;
+            pts.clear();
+            pts.push_back({ x, y });
+            int minX = x, maxX = x, minY = y, maxY = y;
+
+            size_t head = 0;
+            while (head < pts.size()) {
+                Pt cur = pts[head++];
+                minX = std::min(minX, cur.x);
+                maxX = std::max(maxX, cur.x);
+                minY = std::min(minY, cur.y);
+                maxY = std::max(maxY, cur.y);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    int ny = cur.y + dy;
+                    if (ny < 0 || ny >= srcH) continue;
+                    for (int dx = -2; dx <= 2; ++dx) { // 2px horiz bridge links wavy peaks
+                        int nx = cur.x + dx;
+                        if (nx < 0 || nx >= srcW) continue;
+                        size_t nIdx = static_cast<size_t>(ny) * srcW + nx;
+                        if (!visited[nIdx] && sqMask[nIdx]) {
+                            visited[nIdx] = 1;
+                            pts.push_back({ nx, ny });
+                        }
+                    }
+                }
+            }
+
+            int h = maxY - minY + 1;
+            int w = maxX - minX + 1;
+            if (h > maxSqH || w < minSqW) continue;
+
+            // Verify there is normal non-squiggle text ink directly above this underline band
+            int aboveCols = 0;
+            int yA0 = std::max(0, minY - lookUpMax);
+            int yA1 = std::max(0, minY - lookUpMin);
+            if (yA1 <= yA0) continue;
+            for (int ax = minX; ax <= maxX; ++ax) {
+                bool colHasText = false;
+                for (int ay = yA0; ay < yA1; ++ay) {
+                    size_t aIdx = static_cast<size_t>(ay) * srcW + ax;
+                    if (pf.inkMask[aIdx] && !sqMask[aIdx]) {
+                        colHasText = true;
+                        break;
+                    }
+                }
+                if (colHasText) ++aboveCols;
+            }
+
+            if (aboveCols * 10 >= w * 3) {
+                // Erase squiggle pixels + immediate 1px colored anti-alias fringe from inkMask & clean/raw bitmaps
+                int ey0 = std::max(0, minY - 1);
+                int ey1 = std::min(srcH - 1, maxY + 1);
+                int ex0 = std::max(0, minX - 1);
+                int ex1 = std::min(srcW - 1, maxX + 1);
+                for (int ey = ey0; ey <= ey1; ++ey) {
+                    const uint8_t* sRow = src.pixels.data() + static_cast<size_t>(ey) * src.stride;
+                    uint8_t* dRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(ey) * pf.cleanBmp.stride;
+                    uint8_t* nRow = pf.rawNormBmp.pixels.data() + static_cast<size_t>(ey) * pf.rawNormBmp.stride;
+                    uint8_t* mRow = pf.inkMask.data() + static_cast<size_t>(ey) * srcW;
+                    uint8_t* delRow = pf.maxDeltaMap.data() + static_cast<size_t>(ey) * srcW;
+                    uint8_t* qRow = sqMask.data() + static_cast<size_t>(ey) * srcW;
+                    for (int ex = ex0; ex <= ex1; ++ex) {
+                        int b = sRow[ex * 4 + 0], g = sRow[ex * 4 + 1], r = sRow[ex * 4 + 2];
+                        bool chromaFringe = qRow[ex] || (r - std::max(g, b) >= 38) || (std::min(r, g) - b >= 45 && r - g <= 65);
+                        if (chromaFringe) {
+                            mRow[ex] = 0;
+                            delRow[ex] = 0;
+                            dRow[ex * 4 + 0] = dRow[ex * 4 + 1] = dRow[ex * 4 + 2] = 255;
+                            nRow[ex * 4 + 0] = nRow[ex * 4 + 1] = nRow[ex * 4 + 2] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Detects and erases tall, ultra-thin blinking editor text cursor carets ('|') that extend beyond normal glyph height
+bool SuppressEditorCursorCarets(PreprocessedFrame& pf, float p90GlyphH, float scaleFactor) {
+    const int srcW = pf.cleanBmp.width;
+    const int srcH = pf.cleanBmp.height;
+    const int minCaretH = std::max(14, static_cast<int>(std::ceil(p90GlyphH * 1.20f)));
+    const int maxCaretH = std::max(minCaretH + 8, static_cast<int>(std::ceil(p90GlyphH * 2.10f)));
+    const int maxCaretW = std::max(2, static_cast<int>(std::ceil(2.4f * scaleFactor)));
+    bool erasedAny = false;
+
+    std::vector<uint8_t> caretMask(static_cast<size_t>(srcW) * srcH, 0);
+
+    for (int x = 0; x < srcW; ++x) {
+        int y = 0;
+        while (y < srcH) {
+            if (!pf.inkMask[static_cast<size_t>(y) * srcW + x]) {
+                ++y;
+                continue;
+            }
+            int y0 = y;
+            while (y < srcH && pf.inkMask[static_cast<size_t>(y) * srcW + x]) ++y;
+            int runH = y - y0;
+            if (runH < minCaretH || runH > maxCaretH) continue;
+
+            // Check horizontal extent of this vertical bar at top/bottom tips (carets are thin at both ends)
+            int xL = x, xR = x;
+            while (xL > 0 && (x - xL) < maxCaretW &&
+                   pf.inkMask[static_cast<size_t>(y0 + 1) * srcW + (xL - 1)] &&
+                   pf.inkMask[static_cast<size_t>(y - 2) * srcW + (xL - 1)]) {
+                --xL;
+            }
+            while (xR + 1 < srcW && (xR - xL + 1) < maxCaretW &&
+                   pf.inkMask[static_cast<size_t>(y0 + 1) * srcW + (xR + 1)] &&
+                   pf.inkMask[static_cast<size_t>(y - 2) * srcW + (xR + 1)]) {
+                ++xR;
+            }
+            int barW = xR - xL + 1;
+            if (barW > maxCaretW) continue;
+
+            // Verify at least one side of the vertical bar is mostly clear (protects solid graphic boxes)
+            int leftClear = 0, rightClear = 0;
+            for (int cy = y0; cy < y; ++cy) {
+                if (xL == 0 || !pf.inkMask[static_cast<size_t>(cy) * srcW + (xL - 1)]) ++leftClear;
+                if (xR + 1 >= srcW || !pf.inkMask[static_cast<size_t>(cy) * srcW + (xR + 1)]) ++rightClear;
+            }
+            if (std::max(leftClear, rightClear) * 100 >= runH * 75 &&
+                std::min(leftClear, rightClear) * 100 >= runH * 35) {
+                for (int cy = y0; cy < y; ++cy) {
+                    for (int cx = xL; cx <= xR; ++cx) {
+                        caretMask[static_cast<size_t>(cy) * srcW + cx] = 1;
+                    }
+                }
+                erasedAny = true;
+            }
+        }
+    }
+
+    if (erasedAny) {
+        for (int y = 0; y < srcH; ++y) {
+            uint8_t* dRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
+            uint8_t* nRow = pf.rawNormBmp.pixels.data() + static_cast<size_t>(y) * pf.rawNormBmp.stride;
+            uint8_t* mRow = pf.inkMask.data() + static_cast<size_t>(y) * srcW;
+            uint8_t* delRow = pf.maxDeltaMap.data() + static_cast<size_t>(y) * srcW;
+            const uint8_t* cRow = caretMask.data() + static_cast<size_t>(y) * srcW;
+            for (int x = 0; x < srcW; ++x) {
+                if (cRow[x]) {
+                    mRow[x] = 0;
+                    delRow[x] = 0;
+                    dRow[x * 4 + 0] = dRow[x * 4 + 1] = dRow[x * 4 + 2] = 255;
+                    nRow[x * 4 + 0] = nRow[x * 4 + 1] = nRow[x * 4 + 2] = 255;
+                }
+            }
+        }
+    }
+    return erasedAny;
+}
+
+PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
+    PreprocessedFrame pf;
+    const int srcW = src.width;
+    const int srcH = src.height;
+    const size_t totalPixels = static_cast<size_t>(srcW) * srcH;
+    const uint8_t* srcPx = src.pixels.data();
+
+    pf.cleanBmp.width = srcW;
+    pf.cleanBmp.height = srcH;
+    pf.cleanBmp.stride = srcW * 4;
+    pf.cleanBmp.scaleFactor = src.scaleFactor;
+    pf.cleanBmp.screenOriginX = src.screenOriginX;
+    pf.cleanBmp.screenOriginY = src.screenOriginY;
+    pf.cleanBmp.pixels.resize(totalPixels * 4, 255);
+
+    pf.rawNormBmp = pf.cleanBmp;
+    pf.inkMask.assign(totalPixels, 0);
+    pf.maxDeltaMap.assign(totalPixels, 0);
+    pf.scaleFactor = std::max(1.0f, src.scaleFactor);
+
+    uint64_t lumSum = 0;
+    for (size_t i = 0; i < totalPixels; i += 4) {
+        uint32_t b = srcPx[i * 4 + 0];
+        uint32_t g = srcPx[i * 4 + 1];
+        uint32_t r = srcPx[i * 4 + 2];
+        lumSum += (r * 77 + g * 150 + b * 29) >> 8;
+    }
+    uint32_t avgLum = (totalPixels > 0) ? static_cast<uint32_t>(lumSum / ((totalPixels + 3) / 4)) : 128;
+    bool isDarkTheme = (avgLum < 140);
+
+    const int cellW = std::max(36, static_cast<int>(36.0f * src.scaleFactor));
+    const int cellH = 2;
+    const int gridW = (srcW + cellW - 1) / cellW;
+    const int gridH = (srcH + cellH - 1) / cellH;
+
+    struct RgbBg { int r, g, b; };
+    std::vector<RgbBg> bgGrid(static_cast<size_t>(gridW) * gridH);
+
+    struct SamplePx { int lum, r, g, b; };
+
+    const int bgChunkRows = 16;
+    const size_t bgChunks = static_cast<size_t>((gridH + bgChunkRows - 1) / bgChunkRows);
+    ParallelFor(bgChunks, [&](size_t chunk) {
+        int gyStart = static_cast<int>(chunk) * bgChunkRows;
+        int gyEnd = std::min(gridH, gyStart + bgChunkRows);
+        std::vector<SamplePx> cellSamples;
+        cellSamples.reserve(128);
+
+        for (int gy = gyStart; gy < gyEnd; ++gy) {
+            int y0 = gy * cellH;
+            int y1 = std::min(srcH, y0 + cellH);
+            for (int gx = 0; gx < gridW; ++gx) {
+                int x0 = std::max(0, gx * cellW - cellW / 4);
+                int x1 = std::min(srcW, (gx + 1) * cellW + cellW / 4);
+
+                cellSamples.clear();
+                for (int y = y0; y < y1; ++y) {
+                    const uint8_t* row = srcPx + static_cast<size_t>(y) * src.stride;
+                    for (int x = x0; x < x1; x += 2) {
+                        int b = row[x * 4 + 0];
+                        int g = row[x * 4 + 1];
+                        int r = row[x * 4 + 2];
+                        int lum = (r * 77 + g * 150 + b * 29) >> 8;
+                        cellSamples.push_back({ lum, r, g, b });
+                    }
+                }
+
+                if (cellSamples.empty()) {
+                    bgGrid[static_cast<size_t>(gy) * gridW + gx] = isDarkTheme ? RgbBg{ 24, 24, 28 } : RgbBg{ 245, 245, 245 };
+                } else {
+                    size_t targetIdx = isDarkTheme ? (cellSamples.size() / 4) : ((cellSamples.size() * 3) / 4);
+                    std::nth_element(cellSamples.begin(), cellSamples.begin() + targetIdx, cellSamples.end(),
+                        [](const SamplePx& a, const SamplePx& b) { return a.lum < b.lum; });
+                    const auto& bg = cellSamples[targetIdx];
+                    bgGrid[static_cast<size_t>(gy) * gridW + gx] = { bg.r, bg.g, bg.b };
+                }
+            }
+        }
+    });
+
+    const int pxChunkRows = 32;
+    const size_t pxChunks = static_cast<size_t>((srcH + pxChunkRows - 1) / pxChunkRows);
+    ParallelFor(pxChunks, [&](size_t chunk) {
+        int yStart = static_cast<int>(chunk) * pxChunkRows;
+        int yEnd = std::min(srcH, yStart + pxChunkRows);
+        for (int y = yStart; y < yEnd; ++y) {
+            int gy = std::clamp(y / cellH, 0, gridH - 1);
+            const uint8_t* sRow = srcPx + static_cast<size_t>(y) * src.stride;
+            uint8_t* dRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
+            uint8_t* nRow = pf.rawNormBmp.pixels.data() + static_cast<size_t>(y) * pf.rawNormBmp.stride;
+            uint8_t* mRow = pf.inkMask.data() + static_cast<size_t>(y) * srcW;
+            uint8_t* delRow = pf.maxDeltaMap.data() + static_cast<size_t>(y) * srcW;
+
+            for (int x = 0; x < srcW; ++x) {
+                float fx = (static_cast<float>(x) + 0.5f) / cellW - 0.5f;
+                int gx0 = std::clamp(static_cast<int>(std::floor(fx)), 0, gridW - 1);
+                int gx1 = std::min(gx0 + 1, gridW - 1);
+                float wx = std::clamp(fx - gx0, 0.0f, 1.0f);
+
+                const auto& c0 = bgGrid[static_cast<size_t>(gy) * gridW + gx0];
+                const auto& c1 = bgGrid[static_cast<size_t>(gy) * gridW + gx1];
+
+                int bgR = static_cast<int>(c0.r * (1.0f - wx) + c1.r * wx);
+                int bgG = static_cast<int>(c0.g * (1.0f - wx) + c1.g * wx);
+                int bgB = static_cast<int>(c0.b * (1.0f - wx) + c1.b * wx);
+
+                int b = sRow[x * 4 + 0];
+                int g = sRow[x * 4 + 1];
+                int r = sRow[x * 4 + 2];
+
+                uint8_t ink = 255;
+                uint8_t gentleInk = 255;
+                int maxD = 0;
+                if (isDarkTheme) {
+                    int dR = std::max(0, r - bgR);
+                    int dG = std::max(0, g - bgG);
+                    int dB = std::max(0, b - bgB);
+                    maxD = std::max({ dR, dG, dB });
+                    int lumD = (dR * 77 + dG * 150 + dB * 29) >> 8;
+                    int delta = (maxD * 2 + lumD) / 3;
+
+                    if (delta > 19) {
+                        float t = std::clamp(static_cast<float>(delta - 19) / 100.0f, 0.0f, 1.0f);
+                        float smooth = t * t * (3.0f - 2.0f * t);
+                        ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
+                    }
+                    if (delta > 12) {
+                        float tg = std::clamp(static_cast<float>(delta - 12) / 145.0f, 0.0f, 1.0f);
+                        gentleInk = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - tg), 0.0f, 255.0f));
+                    }
+                } else {
+                    int dR = std::max(0, bgR - r);
+                    int dG = std::max(0, bgG - g);
+                    int dB = std::max(0, bgB - b);
+                    maxD = std::max({ dR, dG, dB });
+
+                    if (maxD > 17) {
+                        float t = std::clamp(static_cast<float>(maxD - 17) / 104.0f, 0.0f, 1.0f);
+                        float smooth = t * t * (3.0f - 2.0f * t);
+                        ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
+                    }
+                    if (maxD > 10) {
+                        float tg = std::clamp(static_cast<float>(maxD - 10) / 145.0f, 0.0f, 1.0f);
+                        gentleInk = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - tg), 0.0f, 255.0f));
+                    }
+                }
+
+                dRow[x * 4 + 0] = ink;
+                dRow[x * 4 + 1] = ink;
+                dRow[x * 4 + 2] = ink;
+                dRow[x * 4 + 3] = 255;
+
+                nRow[x * 4 + 0] = gentleInk;
+                nRow[x * 4 + 1] = gentleInk;
+                nRow[x * 4 + 2] = gentleInk;
+                nRow[x * 4 + 3] = 255;
+
+                delRow[x] = static_cast<uint8_t>(std::clamp(maxD, 0, 255));
+                if (maxD >= 36 || ink < 190) {
+                    mRow[x] = 1;
+                }
+            }
+        }
+    });
+
+    // Suppress thin red/yellow wavy ESLint/TypeScript squiggles before 8-CC segmentation
+    SuppressEditorSquiggles(src, pf);
+
+    // Extract 8-connected components from inkMask with 5-zone vertical curvature profiles
+    std::vector<InkComponent> rawComps;
+    ExtractInkComponents(pf.inkMask, srcW, srcH, 0, srcH, rawComps);
 
     std::vector<int> heights;
     heights.reserve(rawComps.size());
@@ -466,10 +767,17 @@ PreprocessedFrame PreprocessCodeBitmap(const RawBitmap& src) {
         }
     }
     if (!heights.empty()) {
-        std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
+        std::sort(heights.begin(), heights.end());
         pf.medGlyphH = static_cast<float>(heights[heights.size() / 2]);
+        pf.p90GlyphH = static_cast<float>(heights[(heights.size() * 9) / 10]);
     } else {
         pf.medGlyphH = 15.0f * src.scaleFactor;
+        pf.p90GlyphH = 19.0f * src.scaleFactor;
+    }
+
+    // Remove tall blinking vertical editor cursor carets ('|') and re-extract components if any were found
+    if (SuppressEditorCursorCarets(pf, pf.p90GlyphH, pf.scaleFactor)) {
+        ExtractInkComponents(pf.inkMask, srcW, srcH, 0, srcH, rawComps);
     }
 
     pf.comps.reserve(rawComps.size());
@@ -560,7 +868,7 @@ struct DetBox {
     std::vector<InkComponent> comps;
 };
 
-std::vector<DetBox> BuildComponentLineBoxes(const PreprocessedFrame& pf) {
+std::vector<DetBox> BuildComponentLineBoxes(PreprocessedFrame& pf) {
     float refH = std::max(10.0f, pf.medGlyphH);
 
     std::vector<const InkComponent*> seedComps;
@@ -682,6 +990,173 @@ std::vector<DetBox> BuildComponentLineBoxes(const PreprocessedFrame& pf) {
         }
     }
 
+    // Empty-Band Adaptive Faint-Line Rescue:
+    // Inspect vertical gaps between detected rows using a lower contrast threshold (maxDelta >= 17)
+    // so dimmed VS Code comments (#545862) and faded unused imports are never silently dropped.
+    const int srcW = pf.cleanBmp.width;
+    const int srcH = pf.cleanBmp.height;
+    if (!pf.maxDeltaMap.empty() && srcW > 0 && srcH > 0) {
+        std::vector<std::pair<int, int>> occupied;
+        occupied.reserve(rows.size());
+        for (const auto& r : rows) {
+            occupied.push_back({ std::max(0, r.minY - 2), std::min(srcH, r.maxY + 3) });
+        }
+        std::sort(occupied.begin(), occupied.end());
+
+        std::vector<std::pair<int, int>> gaps;
+        int curTop = 0;
+        for (const auto& occ : occupied) {
+            if (occ.first - curTop >= static_cast<int>(refH * 1.15f)) {
+                gaps.push_back({ curTop, occ.first });
+            }
+            curTop = std::max(curTop, occ.second);
+        }
+        if (srcH - curTop >= static_cast<int>(refH * 1.15f)) {
+            gaps.push_back({ curTop, srcH });
+        }
+
+        if (!gaps.empty()) {
+            std::vector<uint8_t> faintMask(static_cast<size_t>(srcW) * srcH, 0);
+            const int minFaintPx = std::max(3, static_cast<int>(3.0f * pf.scaleFactor));
+            bool addedAny = false;
+
+            for (const auto& gp : gaps) {
+                int gy0 = std::clamp(gp.first + 2, 0, srcH);
+                int gy1 = std::clamp(gp.second - 2, gy0, srcH);
+                if (gy1 - gy0 < static_cast<int>(refH * 0.65f)) continue;
+
+                int faintPixels = 0;
+                for (int y = gy0; y < gy1; ++y) {
+                    const uint8_t* delRow = pf.maxDeltaMap.data() + static_cast<size_t>(y) * srcW;
+                    uint8_t* fmRow = faintMask.data() + static_cast<size_t>(y) * srcW;
+                    for (int x = 0; x < srcW; ++x) {
+                        if (delRow[x] >= 17) {
+                            fmRow[x] = 1;
+                            ++faintPixels;
+                        }
+                    }
+                }
+                if (faintPixels < minFaintPx * 4) continue;
+
+                std::vector<InkComponent> rawFaint;
+                ExtractInkComponents(faintMask, srcW, srcH, gy0, gy1, rawFaint);
+
+                std::vector<InkComponent> validFaint;
+                for (const auto& c : rawFaint) {
+                    if (c.pixelCount < minFaintPx) continue;
+                    if (c.height() > static_cast<int>(refH * 2.2f)) continue;
+                    if (c.width() > static_cast<int>(refH * 8.0f) && c.height() <= static_cast<int>(3.5f * pf.scaleFactor)) continue;
+                    validFaint.push_back(c);
+                }
+                if (validFaint.size() < 4) continue;
+
+                std::vector<RowBand> faintRows;
+                std::sort(validFaint.begin(), validFaint.end(), [](const InkComponent& a, const InkComponent& b) {
+                    return a.centerY() < b.centerY();
+                });
+                for (const auto& fc : validFaint) {
+                    if (fc.height() < static_cast<int>(refH * 0.35f)) continue;
+                    RowBand* best = nullptr;
+                    float bestD = 1e9f;
+                    for (auto& fr : faintRows) {
+                        float d = std::abs(fc.centerY() - fr.meanCy());
+                        if (d <= refH * 0.55f && d < bestD) {
+                            bestD = d;
+                            best = &fr;
+                        }
+                    }
+                    if (!best) {
+                        RowBand nr;
+                        nr.minY = fc.minY; nr.maxY = fc.maxY;
+                        nr.sumCy = fc.centerY(); nr.seedCount = 1;
+                        nr.comps.push_back(&fc);
+                        faintRows.push_back(std::move(nr));
+                    } else {
+                        best->minY = std::min(best->minY, fc.minY);
+                        best->maxY = std::max(best->maxY, fc.maxY);
+                        best->sumCy += fc.centerY();
+                        best->seedCount += 1;
+                        best->comps.push_back(&fc);
+                    }
+                }
+                // Attach small punctuation in the faint band (dots, slashes, underscores)
+                for (const auto& fc : validFaint) {
+                    if (fc.height() >= static_cast<int>(refH * 0.35f)) continue;
+                    for (auto& fr : faintRows) {
+                        if (fc.minY >= fr.minY - static_cast<int>(refH * 0.25f) &&
+                            fc.maxY <= fr.maxY + static_cast<int>(refH * 0.35f)) {
+                            fr.minY = std::min(fr.minY, fc.minY);
+                            fr.maxY = std::max(fr.maxY, fc.maxY);
+                            fr.comps.push_back(&fc);
+                            break;
+                        }
+                    }
+                }
+
+                for (auto& fr : faintRows) {
+                    if (fr.comps.size() < 4) continue;
+                    std::sort(fr.comps.begin(), fr.comps.end(), [](const InkComponent* a, const InkComponent* b) {
+                        return a->minX < b->minX;
+                    });
+                    DetBox fb;
+                    fb.x0 = static_cast<float>(fr.comps.front()->minX);
+                    fb.x1 = static_cast<float>(fr.comps.front()->maxX + 1);
+                    fb.y0 = static_cast<float>(fr.minY);
+                    fb.y1 = static_cast<float>(fr.maxY + 1);
+                    for (const auto* c : fr.comps) {
+                        fb.x0 = std::min(fb.x0, static_cast<float>(c->minX));
+                        fb.x1 = std::max(fb.x1, static_cast<float>(c->maxX + 1));
+                        fb.y0 = std::min(fb.y0, static_cast<float>(c->minY));
+                        fb.y1 = std::max(fb.y1, static_cast<float>(c->maxY + 1));
+                        fb.comps.push_back(*c);
+                    }
+                    if (fb.x1 - fb.x0 < refH * 1.8f || fb.y1 - fb.y0 < refH * 0.45f) continue;
+
+                    // Locally stretch faint-line contrast in cleanBmp & rawNormBmp to crisp black-on-white
+                    int bx0 = std::clamp(static_cast<int>(fb.x0) - 4, 0, srcW - 1);
+                    int bx1 = std::clamp(static_cast<int>(fb.x1) + 4, bx0 + 1, srcW);
+                    int by0 = std::clamp(static_cast<int>(fb.y0) - 3, 0, srcH - 1);
+                    int by1 = std::clamp(static_cast<int>(fb.y1) + 3, by0 + 1, srcH);
+
+                    int peakDelta = 38;
+                    for (int y = by0; y < by1; ++y) {
+                        const uint8_t* delRow = pf.maxDeltaMap.data() + static_cast<size_t>(y) * srcW;
+                        for (int x = bx0; x < bx1; ++x) peakDelta = std::max<int>(peakDelta, delRow[x]);
+                    }
+                    float span = static_cast<float>(std::max(24, peakDelta - 10));
+
+                    for (int y = by0; y < by1; ++y) {
+                        const uint8_t* delRow = pf.maxDeltaMap.data() + static_cast<size_t>(y) * srcW;
+                        uint8_t* dRow = pf.cleanBmp.pixels.data() + static_cast<size_t>(y) * pf.cleanBmp.stride;
+                        uint8_t* nRow = pf.rawNormBmp.pixels.data() + static_cast<size_t>(y) * pf.rawNormBmp.stride;
+                        for (int x = bx0; x < bx1; ++x) {
+                            int d = delRow[x];
+                            if (d > 10) {
+                                float t = std::clamp(static_cast<float>(d - 10) / span, 0.0f, 1.0f);
+                                float smooth = t * t * (3.0f - 2.0f * t);
+                                uint8_t ink = static_cast<uint8_t>(std::clamp(255.0f * (1.0f - smooth), 0.0f, 255.0f));
+                                dRow[x * 4 + 0] = dRow[x * 4 + 1] = dRow[x * 4 + 2] = ink;
+                                nRow[x * 4 + 0] = nRow[x * 4 + 1] = nRow[x * 4 + 2] = ink;
+                            }
+                        }
+                    }
+
+                    boxes.push_back(std::move(fb));
+                    addedAny = true;
+                }
+            }
+
+            if (addedAny) {
+                std::sort(boxes.begin(), boxes.end(), [](const DetBox& a, const DetBox& b) {
+                    float cyA = 0.5f * (a.y0 + a.y1);
+                    float cyB = 0.5f * (b.y0 + b.y1);
+                    if (std::abs(cyA - cyB) > 6.0f) return cyA < cyB;
+                    return a.x0 < b.x0;
+                });
+            }
+        }
+    }
+
     return boxes;
 }
 
@@ -791,8 +1266,9 @@ bool HasTwoHorizontalBarsAt(const DetBox& bx, const PreprocessedFrame& pf, float
     return false;
 }
 
-RecResult DecodeBoxWithRecognizer(Recognizer& rec, const RawBitmap& viewBmp, const DetBox& bx,
-                                  bool constrainAscii, Ort::MemoryInfo& memInfo) {
+RecResult DecodeBoxWithRecognizer(Recognizer& rec, size_t sessionSlot, const RawBitmap& viewBmp, const DetBox& bx,
+                                  bool constrainAscii, Ort::MemoryInfo& memInfo,
+                                  std::vector<float>& inputBuf) {
     RecResult res;
     float tightW = bx.x1 - bx.x0;
     float tightH = bx.y1 - bx.y0;
@@ -808,18 +1284,19 @@ RecResult DecodeBoxWithRecognizer(Recognizer& rec, const RawBitmap& viewBmp, con
     int batchW = std::max(kRecMinWidth, ((rw + 7) / 8) * 8);
 
     const size_t plane = static_cast<size_t>(batchW) * kRecHeight;
-    std::vector<float> input(3 * plane, 1.0f);  // +1.0f = pure white background
+    inputBuf.assign(3 * plane, 1.0f);  // +1.0f = pure white background
 
     const float mean[3] = { 0.5f, 0.5f, 0.5f };
     const float stdv[3] = { 0.5f, 0.5f, 0.5f };
     ResampleToTensor(viewBmp, cropX, cropY, cropW, cropH, rw, kRecHeight, batchW, plane,
-                     input.data(), mean, stdv, false);
+                     inputBuf.data(), mean, stdv, false);
 
     std::array<int64_t, 4> shape{ 1, 3, kRecHeight, batchW };
-    Ort::Value inTensor = Ort::Value::CreateTensor<float>(memInfo, input.data(), input.size(), shape.data(), shape.size());
+    Ort::Value inTensor = Ort::Value::CreateTensor<float>(memInfo, inputBuf.data(), inputBuf.size(), shape.data(), shape.size());
     const char* inNames[] = { rec.inName.c_str() };
     const char* outNames[] = { rec.outName.c_str() };
-    auto outputs = rec.session.Run(Ort::RunOptions{ nullptr }, inNames, &inTensor, 1, outNames, 1);
+    auto& sess = rec.sessions[sessionSlot % rec.sessions.size()];
+    auto outputs = sess.Run(Ort::RunOptions{ nullptr }, inNames, &inTensor, 1, outNames, 1);
 
     auto outShape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
     const int T = static_cast<int>(outShape[1]);
@@ -983,38 +1460,92 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
     Recognizer* recV4 = e.Find(L"v4");
     Recognizer* recV5 = e.Find(L"v5");
 
-    auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    std::vector<wchar_t> openStack;
+    // Stage A: Parallel Multi-Threaded Neural Inference with LPT (Longest-Processing-Time-First) Work-Stealing
+    // across private per-worker Ort::Sessions (zero BFCArena contention).
+    std::vector<size_t> order(boxes.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return (boxes[a].x1 - boxes[a].x0) > (boxes[b].x1 - boxes[b].x0);
+    });
 
-    for (size_t i = 0; i < boxes.size(); ++i) {
-        const DetBox& bx = boxes[i];
-        float tightW = bx.x1 - bx.x0;
-
+    auto inferOneBox = [&](size_t boxIdx, size_t workerId, Ort::MemoryInfo& memInfo, std::vector<float>& inputBuf) {
+        const DetBox& bx = boxes[boxIdx];
         RecResult res;
         if (opts.model == L"v5" && recV5) {
-            res = DecodeBoxWithRecognizer(*recV5, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+            res = DecodeBoxWithRecognizer(*recV5, workerId, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo, inputBuf);
         } else if (opts.model == L"v4" && recV4) {
-            res = DecodeBoxWithRecognizer(*recV4, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+            res = DecodeBoxWithRecognizer(*recV4, workerId, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo, inputBuf);
         } else if (recV4 && recV5) {
-            RecResult r4 = DecodeBoxWithRecognizer(*recV4, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+            RecResult r4 = DecodeBoxWithRecognizer(*recV4, workerId, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo, inputBuf);
             if (r4.minProb < 0.93f || r4.meanProb < 0.97f) {
-                RecResult r5 = DecodeBoxWithRecognizer(*recV5, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+                RecResult r5 = DecodeBoxWithRecognizer(*recV5, workerId, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo, inputBuf);
                 res = FuseRecResultsByWord(r4, r5);
             } else {
                 res = std::move(r4);
             }
             if (opts.dualViewVerify && (res.meanProb < 0.88f || res.minProb < 0.58f)) {
-                RecResult rawCand = DecodeBoxWithRecognizer(*recV5, pf.rawNormBmp, bx, opts.constrainToCodeAscii, memInfo);
+                RecResult rawCand = DecodeBoxWithRecognizer(*recV5, workerId, pf.rawNormBmp, bx, opts.constrainToCodeAscii, memInfo, inputBuf);
                 if (rawCand.meanProb > res.meanProb + 0.03f && rawCand.chars.size() >= res.chars.size()) {
                     res = std::move(rawCand);
                 }
             }
         } else {
-            res = DecodeBoxWithRecognizer(*e.recs.front(), pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo);
+            res = DecodeBoxWithRecognizer(*e.recs.front(), workerId, pf.cleanBmp, bx, opts.constrainToCodeAscii, memInfo, inputBuf);
         }
+        results[boxIdx] = std::move(res);
+    };
+
+    size_t numWorkers = OptimalWorkerCount(boxes.size());
+    if (numWorkers <= 1) {
+        auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        std::vector<float> inputBuf;
+        for (size_t idx : order) inferOneBox(idx, 0, memInfo, inputBuf);
+    } else {
+        std::atomic<size_t> nextWork{ 0 };
+        std::vector<std::thread> workers;
+        workers.reserve(numWorkers - 1);
+        auto workerLoop = [&](size_t workerId) {
+            auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+            std::vector<float> inputBuf;
+            inputBuf.reserve(3 * kRecHeight * 640);
+            while (true) {
+                size_t k = nextWork.fetch_add(1, std::memory_order_relaxed);
+                if (k >= order.size()) break;
+                inferOneBox(order[k], workerId, memInfo, inputBuf);
+            }
+        };
+        for (size_t t = 1; t < numWorkers; ++t) {
+            workers.emplace_back(workerLoop, t);
+        }
+        workerLoop(0);
+        for (auto& w : workers) w.join();
+    }
+
+    // Stage B: Deterministic Top-to-Bottom Topological Verification & PDA Delimiter Stack (< 0.1 ms)
+    std::vector<wchar_t> openStack;
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        const DetBox& bx = boxes[i];
+        float tightW = bx.x1 - bx.x0;
+        RecResult& res = results[i];
 
         // Case A: Standalone 1-3 component symbol box ('}', '{', '};', ')')
-        if (!bx.comps.empty() && bx.comps.size() <= 3 && tightW <= pf.medGlyphH * 1.65f) {
+        // Guard against overwriting multi-digit line numbers (e.g. "45" where '4' has left-leaning curvature):
+        // any trailing components after bx.comps[0] must be small punctuation (';', ','), never full-height glyphs.
+        bool isStandaloneBracketBox = !bx.comps.empty() && bx.comps.size() <= 3 && tightW <= pf.medGlyphH * 1.65f;
+        if (isStandaloneBracketBox && bx.comps.size() >= 2) {
+            for (size_t ci = 1; ci < bx.comps.size(); ++ci) {
+                if (bx.comps[ci].height() > static_cast<int>(pf.medGlyphH * 0.72f) ||
+                    bx.comps[ci].width() > static_cast<int>(pf.medGlyphH * 0.50f)) {
+                    isStandaloneBracketBox = false;
+                    break;
+                }
+            }
+        }
+        if (isStandaloneBracketBox && res.chars.size() >= 2 && std::iswalnum(res.chars[0].ch) &&
+            std::iswalnum(res.chars[1].ch) && res.meanProb >= 0.85f) {
+            isStandaloneBracketBox = false;
+        }
+        if (isStandaloneBracketBox) {
             int curv = GetVerticalBracketCurvature(bx.comps[0], pf.medGlyphH);
             if (curv != 0) {
                 wchar_t sym = (curv > 0) ? L'}' : L'{';
@@ -1105,6 +1636,7 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 if (res.chars[k].ch == L'-') {
                     if (HasTwoHorizontalBarsAt(bx, pf, res.chars[k].x)) {
                         res.chars[k].ch = L'=';
+                        res.chars[k].prob = std::max(res.chars[k].prob, 0.92f);
                     }
                 }
             }
@@ -1205,8 +1737,6 @@ std::vector<RecResult> RunRecognition(Engine& e, const PreprocessedFrame& pf, co
                 }
             }
         }
-
-        results[i] = std::move(res);
     }
     return results;
 }
@@ -1247,8 +1777,12 @@ Segment BuildSegment(const DetBox& bx, const RecResult& rr) {
         if (i >= rr.chars.size()) break;
         size_t j = i;
         std::wstring text;
+        double probSum = 0.0;
+        float minP = 1.0f;
         while (j < rr.chars.size() && rr.chars[j].ch != L' ') {
             text += rr.chars[j].ch;
+            probSum += rr.chars[j].prob;
+            minP = std::min(minP, rr.chars[j].prob);
             ++j;
         }
         float left = (i == 0) ? bx.x0 : std::max(bx.x0, rr.chars[i].x - pitch * 0.45f);
@@ -1257,6 +1791,8 @@ Segment BuildSegment(const DetBox& bx, const RecResult& rr) {
         OcrWordBox w;
         w.text = std::move(text);
         w.bounds = { left, wy0, right - left, wh };
+        w.confidence = (j > i) ? static_cast<float>(probSum / static_cast<double>(j - i)) : 1.0f;
+        w.minCharConf = (j > i) ? minP : 1.0f;
         seg.words.push_back(std::move(w));
         i = j;
     }
@@ -1373,6 +1909,9 @@ bool PaddleOcr::Recognize(const RawBitmap& bitmap, OcrDocument& outDoc, std::wst
             line.bounds = { minX, minY, maxX - minX, maxY - minY };
             outDoc.lines.push_back(std::move(line));
         }
+
+        // Document-level cross-line identifier voting (repairs uncertain smudges using high-confidence occurrences)
+        RepairCrossLineIdentifiers(outDoc);
         return true;
     } catch (const Ort::Exception& ex) {
         if (outError) *outError = L"ONNX Runtime error: " + Utf8ToWide(ex.what());
@@ -1380,6 +1919,163 @@ bool PaddleOcr::Recognize(const RawBitmap& bitmap, OcrDocument& outDoc, std::wst
         if (outError) *outError = L"OCR error: " + Utf8ToWide(ex.what());
     }
     return false;
+}
+
+namespace {
+
+size_t IdentEditDistance(const std::wstring& a, const std::wstring& b) {
+    const size_t n = a.size(), m = b.size();
+    std::vector<size_t> prev(m + 1), cur(m + 1);
+    for (size_t j = 0; j <= m; ++j) prev[j] = j;
+    for (size_t i = 1; i <= n; ++i) {
+        cur[0] = i;
+        for (size_t j = 1; j <= m; ++j) {
+            size_t cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost });
+        }
+        prev.swap(cur);
+    }
+    return prev[m];
+}
+
+bool IsIdentChar(wchar_t c) {
+    return std::iswalnum(c) || c == L'_';
+}
+
+bool DiffersOnlyByDigitOrPluralS(const std::wstring& a, const std::wstring& b) {
+    // Never merge singular/plural identifiers (e.g. "item" vs "items", "user" vs "users")
+    if (a.size() + 1 == b.size() && b.back() == L's' && b.compare(0, a.size(), a) == 0) return true;
+    if (b.size() + 1 == a.size() && a.back() == L's' && a.compare(0, b.size(), b) == 0) return true;
+    // Never merge numbered identifiers (e.g. "node1" vs "node2", "x1" vs "x2")
+    if (a.size() == b.size()) {
+        size_t diffIdx = std::wstring::npos;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (a[i] != b[i]) {
+                if (diffIdx != std::wstring::npos) return false;
+                diffIdx = i;
+            }
+        }
+        if (diffIdx != std::wstring::npos && std::iswdigit(a[diffIdx]) && std::iswdigit(b[diffIdx])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+size_t PaddleOcr::RepairCrossLineIdentifiers(OcrDocument& doc) {
+    struct AnchorStats {
+        int count = 0;
+        float bestMeanConf = 0.0f;
+        float bestMinConf = 0.0f;
+    };
+    std::unordered_map<std::wstring, AnchorStats> stats;
+
+    // Pass 1: Collect identifier statistics across the entire snippet
+    for (const auto& line : doc.lines) {
+        for (const auto& w : line.words) {
+            if (w.isLineNumber) continue;
+            const std::wstring& s = w.text;
+            size_t i = 0;
+            while (i < s.size()) {
+                if (std::iswalpha(s[i]) || s[i] == L'_') {
+                    size_t j = i + 1;
+                    while (j < s.size() && IsIdentChar(s[j])) ++j;
+                    if (j - i >= 5) {
+                        std::wstring id = s.substr(i, j - i);
+                        auto& st = stats[id];
+                        st.count += 1;
+                        st.bestMeanConf = std::max(st.bestMeanConf, w.confidence);
+                        st.bestMinConf = std::max(st.bestMinConf, w.minCharConf);
+                    }
+                    i = j;
+                } else {
+                    ++i;
+                }
+            }
+        }
+    }
+
+    // Build set of trusted high-confidence anchor identifiers
+    std::vector<std::wstring> anchors;
+    for (const auto& kv : stats) {
+        const auto& st = kv.second;
+        if ((st.bestMeanConf >= 0.93f && st.bestMinConf >= 0.85f) || (st.count >= 2 && st.bestMeanConf >= 0.88f)) {
+            anchors.push_back(kv.first);
+        }
+    }
+    if (anchors.empty()) return 0;
+
+    // Pass 2: Repair low-confidence single-occurrence identifiers that uniquely match a trusted anchor at edit distance 1
+    size_t repaired = 0;
+    for (auto& line : doc.lines) {
+        bool lineModified = false;
+        for (auto& w : line.words) {
+            if (w.isLineNumber) continue;
+            if (!w.isUncertain() && w.minCharConf >= 0.82f) continue;
+
+            std::wstring updated;
+            const std::wstring& s = w.text;
+            size_t i = 0;
+            bool wordModified = false;
+
+            while (i < s.size()) {
+                if (std::iswalpha(s[i]) || s[i] == L'_') {
+                    size_t j = i + 1;
+                    while (j < s.size() && IsIdentChar(s[j])) ++j;
+                    std::wstring id = s.substr(i, j - i);
+
+                    auto itSt = stats.find(id);
+                    bool isRareWeak = (id.size() >= 5) && (itSt != stats.end() && itSt->second.count == 1 && itSt->second.bestMinConf < 0.84f);
+                    if (isRareWeak) {
+                        const std::wstring* uniqueMatch = nullptr;
+                        int matchCount = 0;
+                        for (const auto& anc : anchors) {
+                            if (anc == id) { matchCount = 2; break; }
+                            if (std::iswupper(anc[0]) != std::iswupper(id[0])) continue;
+                            if (std::abs(static_cast<int>(anc.size()) - static_cast<int>(id.size())) > 1) continue;
+                            if (DiffersOnlyByDigitOrPluralS(id, anc)) continue;
+
+                            size_t dist = IdentEditDistance(id, anc);
+                            if (dist == 1) {
+                                uniqueMatch = &anc;
+                                ++matchCount;
+                                if (matchCount > 1) break;
+                            }
+                        }
+                        if (matchCount == 1 && uniqueMatch) {
+                            updated += *uniqueMatch;
+                            wordModified = true;
+                            ++repaired;
+                        } else {
+                            updated += id;
+                        }
+                    } else {
+                        updated += id;
+                    }
+                    i = j;
+                } else {
+                    updated += s[i++];
+                }
+            }
+
+            if (wordModified) {
+                w.text = std::move(updated);
+                w.confidence = std::max(w.confidence, 0.90f);
+                w.minCharConf = std::max(w.minCharConf, 0.80f);
+                lineModified = true;
+            }
+        }
+        if (lineModified) {
+            line.text.clear();
+            for (const auto& w : line.words) {
+                if (!line.text.empty()) line.text += L' ';
+                line.text += w.text;
+            }
+        }
+    }
+    return repaired;
 }
 
 } // namespace ScreenTextify

@@ -27,7 +27,13 @@ struct HudButton {
 
 class OverlayWindow {
 public:
-    using OnTextCopiedCallback = std::function<void(const std::wstring& text, bool codeMode, size_t wordCount, double ocrTimeMs)>;
+    using OnTextCopiedCallback = std::function<void(
+        const std::wstring& text,
+        bool codeMode,
+        size_t wordCount,
+        double ocrTimeMs,
+        const std::vector<std::wstring>& uncertainWords
+    )>;
 
     OverlayWindow(HINSTANCE hInstance, AppSettings* settings, OnTextCopiedCallback onCopied);
     ~OverlayWindow();
@@ -83,6 +89,8 @@ private:
     std::vector<HudButton> m_hudButtons;
     RectF m_hudBarRect;
     std::wstring m_hudMetricsText;
+    size_t m_uncertainWordCount = 0;
+    size_t m_gutterWordCount = 0;
 
     // Toast notification state
     std::wstring m_toastTitle;

@@ -46,8 +46,19 @@ struct OcrWordBox {
     RectF bounds;       // Coordinates relative to the virtual screen overlay
     int lineIndex = 0;
     int wordIndex = 0;
+    float confidence = 1.0f;    // Mean character CTC probability [0.0..1.0]
+    float minCharConf = 1.0f;   // Lowest single-character probability in this word [0.0..1.0]
+    bool isLineNumber = false;  // Auto-detected editor line-number gutter token
     bool selected = false;
     bool hovered = false;
+
+    bool isUncertain() const {
+        return !isLineNumber && (confidence < 0.86f || minCharConf < 0.72f);
+    }
+
+    bool isVeryLowConfidence() const {
+        return !isLineNumber && (confidence < 0.75f || minCharConf < 0.55f);
+    }
 };
 
 struct OcrLineBox {
@@ -72,6 +83,26 @@ struct OcrDocument {
         }
         return count;
     }
+
+    size_t uncertainWordCount() const {
+        size_t count = 0;
+        for (const auto& line : lines) {
+            for (const auto& w : line.words) {
+                if (w.isUncertain()) ++count;
+            }
+        }
+        return count;
+    }
+
+    size_t gutterWordCount() const {
+        size_t count = 0;
+        for (const auto& line : lines) {
+            for (const auto& w : line.words) {
+                if (w.isLineNumber) ++count;
+            }
+        }
+        return count;
+    }
 };
 
 struct CaptureHistoryItem {
@@ -80,6 +111,7 @@ struct CaptureHistoryItem {
     bool wasCodeMode = true;
     size_t wordCount = 0;
     double ocrTimeMs = 0.0;
+    std::vector<std::wstring> uncertainWords;
 };
 
 enum class CaptureLaunchMode {
@@ -95,6 +127,8 @@ struct AppSettings {
     bool autoCopyOnRelease = true;      // Copy immediately when mouse drag finishes (Selectext style)
     bool autoCloseAfterCopy = false;    // Close overlay immediately after copying in interactive mode
     bool upscaleForOcr = true;          // 2x super-resolution upscale + dark-mode boost for video text
+    bool stripLineNumbers = true;       // Auto-detect & strip editor line-number gutters (1, 2, 3...)
+    bool showConfidenceHeatmap = true;  // Amber warning highlights on uncertain OCR words
     bool showLivePreviewCard = true;    // Show live formatted code/text card in overlay
     bool startWithWindows = false;      // Launch silently in System Tray on Windows login
 
